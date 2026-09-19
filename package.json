@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start:backend": "node backend/server.js",
+    "scrape": "node backend/scraper.js",
+    "scrape:headed": "node -e \"process.env.HEADLESS='false'; require('./backend/scraper.js')\""
   },
   "keywords": [],
   "author": "",
