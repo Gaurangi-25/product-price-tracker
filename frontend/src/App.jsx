@@ -479,7 +479,7 @@ function App() {
   const handleScrapeNow = async (productId) => {
     try {
       setScrapingStatus((prev) => ({ ...prev, [productId]: true }));
-      showNotification(`Scraper triggered for product ${productId}...`, "info");
+      showNotification(`Scraper running for product ${productId}...`, "info");
 
       const response = await fetch(`${API_URL}/api/scrape/${productId}`, {
         method: "POST",
@@ -487,28 +487,19 @@ function App() {
       const data = await response.json();
 
       if (!response.ok) {
-        showNotification(data.error || "Failed to start scraper", "error");
-        setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
-        return;
+        showNotification(data.error || `Scraping failed for product ${productId}`, "error");
+        await loadProductLogs(productId);
+      } else {
+        showNotification(`Updated latest data for product ${productId}`, "success");
+        await loadProductHistory(productId);
+        await loadProductLogs(productId);
+        await loadTrackedProducts();
       }
-
-      // Poll periodically to catch the newly saved price & log rows
-      const pollIntervals = [3000, 7000, 12000, 18000];
-      pollIntervals.forEach((delay, idx) => {
-        setTimeout(async () => {
-          await loadProductHistory(productId);
-          await loadProductLogs(productId);
-
-          if (idx === pollIntervals.length - 1) {
-            setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
-            showNotification(`Updated latest data for product ${productId}`, "success");
-          }
-        }, delay);
-      });
     } catch (error) {
       console.error("Scrape trigger failed:", error);
+      showNotification("Could not complete scraper process.", "error");
+    } finally {
       setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
-      showNotification("Could not trigger scraper process.", "error");
     }
   };
 

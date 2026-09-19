@@ -188,16 +188,23 @@ async function scrapeProduct(productUrl = targetUrl) {
   console.log(`🖥️ Browser Mode: ${IS_HEADLESS ? "Headless" : "Headed (Observable)"}`);
   console.log("=======================================================\n");
 
-  const browser = await chromium.launch({
-    headless: IS_HEADLESS,
-    slowMo: IS_HEADLESS ? 0 : 40,
-  });
-
-  const page = await browser.newPage();
+  let browser = null;
   let totalAttempts = 0;
   let lastError = null;
 
   try {
+    browser = await chromium.launch({
+      headless: IS_HEADLESS,
+      slowMo: IS_HEADLESS ? 0 : 40,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+      ],
+    });
+
+    const page = await browser.newPage();
     // Inject real-time MutationObserver to automatically click "ACCEPT"
     // the very millisecond the cookie banner is attached to the DOM.
     // The store's cookie popup requires up to 3 clicks to dismiss fully.
@@ -440,9 +447,31 @@ async function scrapeProduct(productUrl = targetUrl) {
       attempts: totalAttempts,
       error: lastError,
     };
+  } catch (fatalErr) {
+    console.error(`\n❌ Scraper fatal exception for product ${productId}:`, fatalErr.message);
+    await saveScrapeLog({
+      productId,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      status: "failed",
+      attempts: Math.max(totalAttempts, 1),
+      price: null,
+      stock: null,
+      errorMessage: fatalErr.message,
+    });
+    return {
+      success: false,
+      productId,
+      price: null,
+      stock: null,
+      attempts: Math.max(totalAttempts, 1),
+      error: fatalErr.message,
+    };
   } finally {
-    console.log("🔴 Closing browser...");
-    await browser.close().catch(() => {});
+    if (browser) {
+      console.log("🔴 Closing browser...");
+      await browser.close().catch(() => {});
+    }
   }
 }
 

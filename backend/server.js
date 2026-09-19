@@ -2,7 +2,6 @@ const express = require("express");
 const cors = require("cors");
 const supabase = require("./supabase");
 const { chromium } = require("playwright");
-const { spawn } = require("child_process");
 
 const app = express();
 
@@ -65,31 +64,25 @@ app.post("/api/scrape/:productId", async (req, res) => {
       });
     }
 
-    const scraper = spawn("node", ["scraper.js", product.product_url], {
-      cwd: __dirname,
-      env: {
-        ...process.env,
-        PRODUCT_URL: product.product_url,
-      },
-    });
+    console.log(`⚡ On-demand scrape requested for product ${productId} (${product.product_name})`);
+    const { scrapeProduct } = require("./scraper");
+    const result = await scrapeProduct(product.product_url);
 
-    scraper.stdout.on("data", (data) => {
-      console.log(`SCRAPER: ${data}`);
-    });
-
-    scraper.stderr.on("data", (data) => {
-      console.error(`SCRAPER ERROR: ${data}`);
-    });
-
-    scraper.on("close", (code) => {
-      console.log(`🛑 Scraper finished with code ${code}`);
-    });
-
-    res.json({
-      message: "Scraper started",
-      product_id: product.product_id,
-      product_name: product.product_name,
-    });
+    if (result && result.success) {
+      return res.json({
+        message: "Scraping completed successfully",
+        product_id: product.product_id,
+        product_name: product.product_name,
+        price: result.price,
+        stock: result.stock,
+      });
+    } else {
+      return res.status(500).json({
+        error: (result && result.error) || "Scraper could not resolve price",
+        product_id: product.product_id,
+        product_name: product.product_name,
+      });
+    }
   } catch (error) {
     res.status(500).json({
       error: error.message,
@@ -410,6 +403,12 @@ app.get("/api/search", async (req, res) => {
 
     browser = await chromium.launch({
       headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+      ],
     });
 
     if (isAborted || req.destroyed) return;
