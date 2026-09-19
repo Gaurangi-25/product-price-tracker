@@ -275,9 +275,12 @@ function App() {
       const data = await response.json();
       if (response.ok && Array.isArray(data)) {
         setProductHistory((prev) => ({ ...prev, [productId]: data }));
+        return data;
       }
+      return [];
     } catch (error) {
       console.error(`Failed to load history for ${productId}:`, error);
+      return [];
     }
   }, []);
 
@@ -287,9 +290,12 @@ function App() {
       const data = await response.json();
       if (response.ok && Array.isArray(data)) {
         setProductLogs((prev) => ({ ...prev, [productId]: data }));
+        return data;
       }
+      return [];
     } catch (error) {
       console.error(`Failed to load logs for ${productId}:`, error);
+      return [];
     }
   }, []);
 
@@ -479,7 +485,7 @@ function App() {
   const handleScrapeNow = async (productId) => {
     try {
       setScrapingStatus((prev) => ({ ...prev, [productId]: true }));
-      showNotification(`Scraper running for product ${productId}...`, "info");
+      showNotification(`Scraper triggered for product ${productId}...`, "info");
 
       const response = await fetch(`${API_URL}/api/scrape/${productId}`, {
         method: "POST",
@@ -487,19 +493,39 @@ function App() {
       const data = await response.json();
 
       if (!response.ok) {
-        showNotification(data.error || `Scraping failed for product ${productId}`, "error");
-        await loadProductLogs(productId);
-      } else {
-        showNotification(`Updated latest data for product ${productId}`, "success");
-        await loadProductHistory(productId);
-        await loadProductLogs(productId);
-        await loadTrackedProducts();
+        showNotification(data.error || "Failed to start scraper", "error");
+        setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
+        return;
       }
+
+      // Poll periodically to catch the newly saved price & log rows
+      const pollIntervals = [3000, 7000, 12000, 18000, 24000];
+      pollIntervals.forEach((delay, idx) => {
+        setTimeout(async () => {
+          const history = await loadProductHistory(productId);
+          const logs = await loadProductLogs(productId);
+
+          if (idx === pollIntervals.length - 1) {
+            setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
+            if (history && history.length > 0) {
+              showNotification(`Updated latest data for product ${productId}`, "success");
+            } else if (logs && logs.length > 0) {
+              const latestLog = logs[0];
+              if (latestLog.status === "failed") {
+                showNotification(`Scrape failed for product ${productId}: ${latestLog.error_message || "Check logs"}`, "error");
+              } else {
+                showNotification(`Scrape finished for product ${productId}`, "success");
+              }
+            } else {
+              showNotification(`Scrape request submitted for product ${productId}. Refresh shortly.`, "info");
+            }
+          }
+        }, delay);
+      });
     } catch (error) {
       console.error("Scrape trigger failed:", error);
-      showNotification("Could not complete scraper process.", "error");
-    } finally {
       setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
+      showNotification("Could not trigger scraper process.", "error");
     }
   };
 
@@ -698,7 +724,11 @@ function App() {
                           <div className="card-stock-block">
                             <span className="metric-label">Status</span>
                             <span className="badge badge-neutral">
-                              {isScraping ? "Scraping..." : "Not Tracked"}
+                              {isScraping
+                                ? "Scraping..."
+                                : isAlreadyTracked
+                                ? "Awaiting Scrape"
+                                : "Not Tracked"}
                             </span>
                           </div>
                         </div>

@@ -2,6 +2,8 @@
 
 A robust, full-stack web application designed for the **INE Software Engineer Intern Assignment**. The system tracks product prices and stock availability on INE's mock e-commerce storefront ([demo.inelabteamdev.com](https://demo.inelabteamdev.com/)), persisting historical price trends and honest scrape attempt logs into Supabase, and displaying them on an intuitive React dashboard.
 
+> 📖 **Design Document**: For in-depth reverse-engineering findings, anti-bot bypass strategies, architectural trade-offs, and iteration learnings, see [`design.md`](design.md).
+
 ---
 
 ## 🏛️ System Architecture
@@ -186,6 +188,30 @@ node backend/scraper.js https://demo.inelabteamdev.com/product/101
 # Headed (Observable) mode for video recording / inspection:
 npm run scrape:headed
 ```
+
+---
+
+## ☁️ Deployment Guide
+
+### 1. Backend Deployment (Render — Docker Recommended)
+Because Playwright requires Linux OS libraries (`libgbm`, `libnss3`, `libasound2`, etc.), deploying with the included **Dockerfile** guarantees that all dependencies and Chromium are installed with zero configuration issues:
+
+1. In the **Render Dashboard**, create a **New Web Service** and connect your GitHub repository.
+2. Set **Runtime / Environment** to **Docker** (Render will automatically detect the root [`Dockerfile`](file:///e:/IMPORTANT/Projects/product-price-tracker/Dockerfile)).
+3. Add Environment Variables:
+   - `SUPABASE_URL`: `https://<your-supabase-project>.supabase.co`
+   - `SUPABASE_SECRET_KEY`: Your Supabase Service Role Key or API Key
+   - `PORT`: `5000`
+   - `HEADLESS`: `true`
+4. Click **Deploy Web Service**.
+
+### 2. Frontend Deployment (Vercel)
+1. In the **Vercel Dashboard**, click **Add New Project** and select your repository.
+2. Set **Root Directory** to `frontend`.
+3. Set **Framework Preset** to **Vite**.
+4. Add Environment Variable:
+   - `VITE_API_URL`: `https://<your-render-service-name>.onrender.com`
+5. Click **Deploy**.
 
 ---
 

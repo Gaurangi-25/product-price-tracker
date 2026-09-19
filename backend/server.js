@@ -64,25 +64,22 @@ app.post("/api/scrape/:productId", async (req, res) => {
       });
     }
 
-    console.log(`⚡ On-demand scrape requested for product ${productId} (${product.product_name})`);
     const { scrapeProduct } = require("./scraper");
-    const result = await scrapeProduct(product.product_url);
 
-    if (result && result.success) {
-      return res.json({
-        message: "Scraping completed successfully",
-        product_id: product.product_id,
-        product_name: product.product_name,
-        price: result.price,
-        stock: result.stock,
+    // Run scraper in-process asynchronously without blocking HTTP response
+    scrapeProduct(product.product_url)
+      .then((result) => {
+        console.log(`✅ Scraper completed for ${productId}:`, result);
+      })
+      .catch((err) => {
+        console.error(`❌ Scraper execution error for ${productId}:`, err);
       });
-    } else {
-      return res.status(500).json({
-        error: (result && result.error) || "Scraper could not resolve price",
-        product_id: product.product_id,
-        product_name: product.product_name,
-      });
-    }
+
+    res.json({
+      message: "Scraper started",
+      product_id: product.product_id,
+      product_name: product.product_name,
+    });
   } catch (error) {
     res.status(500).json({
       error: error.message,
@@ -403,12 +400,6 @@ app.get("/api/search", async (req, res) => {
 
     browser = await chromium.launch({
       headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
     });
 
     if (isAborted || req.destroyed) return;

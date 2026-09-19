@@ -193,6 +193,7 @@ async function scrapeProduct(productUrl = targetUrl) {
   let lastError = null;
 
   try {
+    totalAttempts = 1;
     browser = await chromium.launch({
       headless: IS_HEADLESS,
       slowMo: IS_HEADLESS ? 0 : 40,
@@ -205,6 +206,7 @@ async function scrapeProduct(productUrl = targetUrl) {
     });
 
     const page = await browser.newPage();
+
     // Inject real-time MutationObserver to automatically click "ACCEPT"
     // the very millisecond the cookie banner is attached to the DOM.
     // The store's cookie popup requires up to 3 clicks to dismiss fully.
@@ -447,25 +449,27 @@ async function scrapeProduct(productUrl = targetUrl) {
       attempts: totalAttempts,
       error: lastError,
     };
-  } catch (fatalErr) {
-    console.error(`\n❌ Scraper fatal exception for product ${productId}:`, fatalErr.message);
+  } catch (criticalErr) {
+    lastError = criticalErr.message;
+    console.error(`\n❌ Critical scraper exception for product ${productId}:`, criticalErr);
     await saveScrapeLog({
       productId,
       startedAt,
       finishedAt: new Date().toISOString(),
       status: "failed",
-      attempts: Math.max(totalAttempts, 1),
+      attempts: totalAttempts || 1,
       price: null,
       stock: null,
-      errorMessage: fatalErr.message,
+      errorMessage: criticalErr.message || "Critical browser execution failure",
     });
+
     return {
       success: false,
       productId,
       price: null,
       stock: null,
-      attempts: Math.max(totalAttempts, 1),
-      error: fatalErr.message,
+      attempts: totalAttempts || 1,
+      error: criticalErr.message,
     };
   } finally {
     if (browser) {
