@@ -507,4 +507,18 @@ app.get("/api/search", async (req, res) => {
 // ----------------------------------------
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
+
+  // In cloud Linux environments (e.g. Render), ensure Playwright Chromium binary is downloaded at runtime
+  if (process.env.RENDER || process.platform === "linux") {
+    setTimeout(() => {
+      try {
+        console.log("🔍 Checking Playwright Chromium runtime availability...");
+        const { execSync } = require("child_process");
+        execSync("npx playwright install chromium", { stdio: "inherit" });
+        console.log("✅ Playwright Chromium ready for scraping");
+      } catch (err) {
+        console.warn("⚠️ Playwright auto-install warning:", err.message);
+      }
+    }, 1000);
+  }
 });

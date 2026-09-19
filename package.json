@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start:backend": "node backend/server.js",
+    "start": "npx playwright install chromium && node backend/server.js",
+    "start:backend": "npx playwright install chromium && node backend/server.js",
+    "build": "npx playwright install --with-deps chromium",
+    "postinstall": "npx playwright install chromium",
     "scrape": "node backend/scraper.js",
     "scrape:headed": "node -e \"process.env.HEADLESS='false'; require('./backend/scraper.js')\""
   },

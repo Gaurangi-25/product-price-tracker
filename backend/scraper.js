@@ -194,16 +194,40 @@ async function scrapeProduct(productUrl = targetUrl) {
 
   try {
     totalAttempts = 1;
-    browser = await chromium.launch({
-      headless: IS_HEADLESS,
-      slowMo: IS_HEADLESS ? 0 : 40,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
-    });
+    try {
+      browser = await chromium.launch({
+        headless: IS_HEADLESS,
+        slowMo: IS_HEADLESS ? 0 : 40,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+        ],
+      });
+    } catch (launchErr) {
+      if (
+        launchErr.message.includes("Executable doesn't exist") ||
+        launchErr.message.includes("npx playwright install")
+      ) {
+        console.warn("⚠️ Chromium executable missing in runtime cache. Auto-installing Playwright Chromium...");
+        const { execSync } = require("child_process");
+        execSync("npx playwright install chromium", { stdio: "inherit" });
+        console.log("✅ Playwright Chromium installed. Retrying browser launch...");
+        browser = await chromium.launch({
+          headless: IS_HEADLESS,
+          slowMo: IS_HEADLESS ? 0 : 40,
+          args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+          ],
+        });
+      } else {
+        throw launchErr;
+      }
+    }
 
     const page = await browser.newPage();
 
