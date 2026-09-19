@@ -1,54 +1,149 @@
 const { chromium } = require("playwright");
 const supabase = require("./supabase");
 
-const url =
-  process.env.PRODUCT_URL || "https://demo.inelabteamdev.com/product/632";
-const PRODUCT_ID = url.split("/").pop();
+// Target URL from CLI argument or environment variable
+const DEFAULT_URL = "https://demo.inelabteamdev.com/product/632";
+const targetUrl = process.argv[2] || process.env.PRODUCT_URL || DEFAULT_URL;
 
-const MAX_ATTEMPTS = 8;
-const PRICE_WAIT_TIMEOUT = 30000;
-const CHECK_INTERVAL = 500;
+// Configuration
+const MAX_CYCLES = 3;
+const PER_CYCLE_TIMEOUT_MS = 35000;
+const IS_HEADLESS = process.env.HEADLESS !== "false";
 
 // ======================================================
-// SUPABASE HELPERS
+// PARSING HELPERS (Bulletproof for all store variations)
 // ======================================================
 
-async function saveTrackedProduct(productName) {
-  const { error } = await supabase.from("tracked_products").upsert(
-    {
-      product_id: PRODUCT_ID,
-      product_name: productName,
-      product_url: url,
-      is_active: true,
-    },
-    {
-      onConflict: "product_id",
-    },
+/**
+ * Extracts integer price from raw price text.
+ * Handles:
+ * - Standard: "₹11,226" -> 11226
+ * - Trailing taxes: "₹29,645/- (incl. of all taxes)" -> 29645
+ * - European notation: "₹29.645,00" -> 29645
+ * - Spaced notation: "₹ 29 645" -> 29645
+ * - Unicode full-width numerals: "₹２９,６４５" -> 29645
+ * - Lakh/decimal: "Rs. 29,645.00" -> 29645
+ * - Zero-width spaces & non-breaking spaces (\u200B, \xA0)
+ */
+function parsePrice(raw) {
+  if (!raw) return null;
+
+  // 1. Convert full-width Unicode numerals (０-９) to ASCII (0-9)
+  let s = raw.replace(/[\uFF10-\uFF19]/g, (m) =>
+    String.fromCharCode(m.charCodeAt(0) - 65248),
   );
 
-  if (error) {
-    throw new Error(`Tracked product save failed: ${error.message}`);
+  // 2. Strip zero-width spaces, word joiners, and non-breaking spaces
+  s = s.replace(/[\u200B\u200C\u200D\uFEFF\xA0]/g, " ");
+
+  // 3. Strip trailing suffixes like "/- (incl. of all taxes)"
+  s = s.replace(/\/.*$/i, "");
+
+  // 4. Extract the currency block (₹ or Rs. followed by digits, dots, commas, spaces)
+  const match = s.match(/(?:₹|Rs\.?)\s*([\d\s.,]+)/i);
+  if (!match) return null;
+
+  let numStr = match[1].trim();
+
+  // 5. Detect European formatting (e.g. 29.645,00 or 1.207,00)
+  if (/\.\d{3},\d{2}$/.test(numStr) || /,\d{2}$/.test(numStr)) {
+    numStr = numStr.replace(/\./g, "").replace(/,\d+$/, "");
+  } else {
+    // Standard notation: remove thousand-separating commas and whitespace
+    numStr = numStr.replace(/,/g, "").replace(/\s/g, "");
+    // Remove trailing decimal cents (.00) if present
+    if (/\.\d+$/.test(numStr)) {
+      numStr = numStr.split(".")[0];
+    }
   }
 
-  console.log("🗄️ Tracked product saved");
+  const num = parseInt(numStr, 10);
+  return Number.isFinite(num) && num > 0 ? num : null;
 }
 
-async function savePriceHistory(price, stock) {
-  const { error } = await supabase.from("price_history").insert({
-    product_id: PRODUCT_ID,
-    price,
-    stock,
-    scraped_at: new Date().toISOString(),
-  });
+/**
+ * Extracts integer stock count from status badge text.
+ * Handles:
+ * - "OUT OF STOCK" or "Sold out" -> 0
+ * - "In stock · 185 left" -> 185
+ * - "Only 126 left" -> 126
+ * - "2 in stock" -> 2
+ * - "Selling fast — 4 left" -> 4
+ * - "Hurry, just 104 left" -> 104
+ */
+function parseStock(raw) {
+  if (!raw) return null;
+  const s = raw.toLowerCase().trim();
 
-  if (error) {
-    throw new Error(`Price history save failed: ${error.message}`);
+  if (s.includes("out of stock") || s.includes("sold out")) {
+    return 0;
   }
 
-  console.log("🗄️ Price history saved");
+  const match = s.match(/(\d[\d,]*)/);
+  if (match) {
+    const num = parseInt(match[1].replace(/,/g, ""), 10);
+    return Number.isFinite(num) && num >= 0 ? num : null;
+  }
+
+  return null;
+}
+
+// ======================================================
+// DATABASE HELPERS (Supabase)
+// ======================================================
+
+async function saveTrackedProduct(productId, productName, productUrl) {
+  try {
+    const { error } = await supabase.from("tracked_products").upsert(
+      {
+        product_id: String(productId),
+        product_name: productName,
+        product_url: productUrl,
+        is_active: true,
+      },
+      { onConflict: "product_id" },
+    );
+
+    if (error) {
+      console.warn("⚠️ Database warning on tracked_products:", error.message);
+    } else {
+      console.log(`🗄️ Tracked product persisted (${productId}: "${productName}")`);
+    }
+  } catch (err) {
+    console.warn("⚠️ Database exception on tracked_products:", err.message);
+  }
+}
+
+async function savePriceHistory(productId, price, stock) {
+  if (!Number.isFinite(price) || price <= 0) {
+    console.error("❌ Refusing to save invalid price to price_history:", price);
+    return;
+  }
+  if (!Number.isFinite(stock) || stock < 0) {
+    console.error("❌ Refusing to save invalid stock to price_history:", stock);
+    return;
+  }
+
+  try {
+    const { error } = await supabase.from("price_history").insert({
+      product_id: String(productId),
+      price,
+      stock,
+      scraped_at: new Date().toISOString(),
+    });
+
+    if (error) {
+      console.error("❌ Price history insert failed:", error.message);
+    } else {
+      console.log(`🗄️ Price history saved: ₹${price} | Stock: ${stock}`);
+    }
+  } catch (err) {
+    console.error("❌ Database exception on price_history:", err.message);
+  }
 }
 
 async function saveScrapeLog({
+  productId,
   startedAt,
   finishedAt,
   status,
@@ -57,731 +152,311 @@ async function saveScrapeLog({
   stock = null,
   errorMessage = null,
 }) {
-  const { error } = await supabase.from("scrape_logs").insert({
-    product_id: PRODUCT_ID,
-    started_at: startedAt,
-    finished_at: finishedAt,
-    status,
-    attempts,
-    price,
-    stock,
-    error_message: errorMessage,
-  });
+  try {
+    const { error } = await supabase.from("scrape_logs").insert({
+      product_id: String(productId),
+      started_at: startedAt,
+      finished_at: finishedAt,
+      status,
+      attempts,
+      price,
+      stock,
+      error_message: errorMessage,
+    });
 
-  if (error) {
-    console.log("⚠️ Scrape log save failed:", error.message);
-  } else {
-    console.log("🗄️ Scrape log saved");
-  }
-}
-
-// ======================================================
-// 1. HANDLE COOKIES
-// ======================================================
-
-async function handleCookies(page) {
-  const acceptButton = page.getByRole("button", {
-    name: "ACCEPT",
-    exact: true,
-  });
-
-  const visible = await acceptButton.isVisible().catch(() => false);
-
-  if (!visible) {
-    return false;
-  }
-
-  console.log("🍪 Cookie popup detected");
-
-  for (let i = 0; i < 3; i++) {
-    try {
-      await acceptButton.scrollIntoViewIfNeeded().catch(() => {});
-
-      await acceptButton.click({
-        force: true,
-        timeout: 3000,
-      });
-
-      await page.waitForTimeout(500);
-
-      const stillVisible = await acceptButton.isVisible().catch(() => false);
-
-      if (!stillVisible) {
-        console.log("✅ Cookie popup accepted");
-        return true;
-      }
-
-      console.log(`⚠️ Cookie popup still visible - retry ${i + 1}/3`);
-    } catch (error) {
-      console.log(`⚠️ Cookie click failed - retry ${i + 1}/3`);
+    if (error) {
+      console.warn("⚠️ Scrape log insert failed:", error.message);
+    } else {
+      console.log(`🗄️ Scrape log saved: status=${status}, attempts=${attempts}`);
     }
+  } catch (err) {
+    console.warn("⚠️ Database exception on scrape_logs:", err.message);
   }
-
-  return false;
 }
 
 // ======================================================
-// 2. EXTRACT ACTUAL PRICE
+// MAIN SCRAPER ENGINE
 // ======================================================
 
-async function extractPrice(page) {
-  const priceBlock = page.locator(".price-block");
-
-  const text = await priceBlock.innerText().catch(() => "");
-
-  console.log("💰 Current price-block text:");
-  console.log(text);
-
-  // Get every ₹ or Rs. price from the visible price block
-  const matches = text.match(/(?:₹|Rs\.)[ \t]*[\d,]+(?:\.\d+)?/gi) || [];
-  console.log("💰 Prices detected:", matches);
-
-  if (matches.length === 0) {
-    return null;
-  }
-
-  const prices = matches.map((value) =>
-    Number(
-      value
-        .replace(/₹/g, "")
-        .replace(/Rs\./gi, "")
-        .replace(/[,\s]/g, "")
-        .trim(),
-    ),
-  );
-
-  console.log("💰 Numeric prices:", prices);
-
-  /*
-    Current page can show:
-
-    ₹15,849
-    Deal price ₹14,264
-    ₹12,679
-
-    OR:
-
-    ₹15,849
-    Deal price ₹14,264
-    Rs. 12,679.00
-
-    The actual displayed selling price is the LAST
-    price amount in the price block.
-  */
-
-  const currentPrice = prices[prices.length - 1];
-
-  if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
-    console.log("❌ Invalid current price");
-    return null;
-  }
-
-  console.log("🎯 CURRENT PRICE DETECTED:", currentPrice);
-
-  return currentPrice;
-}
-
-// ======================================================
-// 3. EXTRACT STOCK
-// ======================================================
-
-async function extractStock(page) {
-  const stockBadge = page.locator(".stock-badge");
-
-  const stockText = await stockBadge.innerText().catch(() => "");
-
-  console.log(`📦 Stock text: "${stockText}"`);
-
-  if (/out of stock/i.test(stockText)) {
-    return 0;
-  }
-
-  const leftMatch = stockText.match(/(\d[\d,]*)\s*left/i);
-
-  const inStockMatch = stockText.match(/(\d[\d,]*)\s*in stock/i);
-
-  if (leftMatch) {
-    return Number(leftMatch[1].replace(/,/g, ""));
-  }
-
-  if (inStockMatch) {
-    return Number(inStockMatch[1].replace(/,/g, ""));
-  }
-
-  return null;
-}
-
-// ======================================================
-// 4. DEBUG CURRENT PRICE AREA
-// ======================================================
-
-async function printPriceDebug(page) {
-  console.log("\n---------------- DEBUG ----------------");
-
-  const priceBlockText = await page
-    .locator(".price-block")
-    .innerText()
-    .catch(() => "");
-
-  console.log("💰 PRICE BLOCK:");
-  console.log(priceBlockText.trim());
-
-  const outputs = page.locator("output");
-
-  const outputCount = await outputs.count().catch(() => 0);
-
-  console.log("🔢 OUTPUT COUNT:", outputCount);
-
-  for (let i = 0; i < outputCount; i++) {
-    const text = await outputs
-      .nth(i)
-      .innerText()
-      .catch(() => "");
-
-    const visible = await outputs
-      .nth(i)
-      .isVisible()
-      .catch(() => false);
-
-    console.log(`   Output ${i + 1}: visible=${visible}, text="${text}"`);
-  }
-
-  const buttons = page.locator(".price-block button");
-
-  const buttonCount = await buttons.count().catch(() => 0);
-
-  console.log("🔘 BUTTON COUNT:", buttonCount);
-
-  for (let i = 0; i < buttonCount; i++) {
-    const text = await buttons
-      .nth(i)
-      .innerText()
-      .catch(() => "");
-
-    const visible = await buttons
-      .nth(i)
-      .isVisible()
-      .catch(() => false);
-
-    const disabled = await buttons
-      .nth(i)
-      .isDisabled()
-      .catch(() => false);
-
-    console.log(
-      `   Button ${i + 1}: visible=${visible}, disabled=${disabled}, text="${text}"`,
-    );
-  }
-
-  console.log("----------------------------------------\n");
-}
-
-// ======================================================
-// 5. CHECK TRY AGAIN
-// ======================================================
-
-async function isTryAgainVisible(page) {
-  const retryButton = page.getByRole("button", {
-    name: /TRY AGAIN/i,
-  });
-
-  return await retryButton.isVisible().catch(() => false);
-}
-
-// ======================================================
-// 6. WAIT FOR RESULT
-// ======================================================
-
-async function waitForResult(page) {
-  const startTime = Date.now();
-
-  let lastDebugTime = 0;
-
-  while (Date.now() - startTime < PRICE_WAIT_TIMEOUT) {
-    // ------------------------------------------
-    // Cookie can appear at any time
-    // ------------------------------------------
-
-    await handleCookies(page);
-
-    // ------------------------------------------
-    // MOST IMPORTANT:
-    // ALWAYS CHECK ACTUAL PRICE FIRST
-    // ------------------------------------------
-
-    const price = await extractPrice(page);
-
-    if (price !== null && Number.isFinite(price) && price > 0) {
-      console.log(`\n🎯 ACTUAL PRICE FOUND: ₹${price}`);
-
-      console.log("🛑 SUCCESS DETECTED — STOPPING CURRENT ATTEMPT");
-
-      return {
-        state: "success",
-        price,
-      };
-    }
-
-    // ------------------------------------------
-    // Only if price NOT found,
-    // check TRY AGAIN
-    // ------------------------------------------
-
-    const retryVisible = await isTryAgainVisible(page);
-
-    if (retryVisible) {
-      console.log("⚠️ TRY AGAIN is visible");
-
-      return {
-        state: "retry",
-        price: null,
-      };
-    }
-
-    // ------------------------------------------
-    // Debug every ~2 seconds
-    // ------------------------------------------
-
-    if (Date.now() - lastDebugTime > 2000) {
-      console.log("⏳ Price not available yet...");
-
-      await printPriceDebug(page);
-
-      lastDebugTime = Date.now();
-    }
-
-    await page.waitForTimeout(CHECK_INTERVAL);
-  }
-
-  return {
-    state: "timeout",
-    price: null,
-  };
-}
-
-// ======================================================
-// 7. MAIN SCRAPER
-// ======================================================
-
-async function scrape() {
+async function scrapeProduct(productUrl = targetUrl) {
   const startedAt = new Date().toISOString();
-  let attempt = 0;
+  const productId = productUrl.split("/product/").pop().replace(/\/$/, "");
 
-  console.log("\n=================================");
-  console.log("🚀 STARTING SCRAPER");
-  console.log("=================================\n");
+  console.log("\n=======================================================");
+  console.log(`🚀 INITIATING SCRAPER FOR PRODUCT: ${productId}`);
+  console.log(`🔗 Target URL: ${productUrl}`);
+  console.log(`🖥️ Browser Mode: ${IS_HEADLESS ? "Headless" : "Headed (Observable)"}`);
+  console.log("=======================================================\n");
 
   const browser = await chromium.launch({
-    headless: process.env.HEADLESS !== "false",
+    headless: IS_HEADLESS,
+    slowMo: IS_HEADLESS ? 0 : 40,
   });
 
-  console.log("🌐 Browser opened");
-
   const page = await browser.newPage();
-
-  console.log("📄 ONE product page created");
+  let totalAttempts = 0;
+  let lastError = null;
 
   try {
-    // ==================================================
-    // OPEN PRODUCT
-    // ==================================================
-
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
-
-    console.log("🌐 Product page opened");
-
-    // ==================================================
-    // SUPABASE - TRACK PRODUCT
-    // ==================================================
-
-    const productName =
-      (
-        await page
-          .locator("h1")
-          .first()
-          .innerText()
-          .catch(() => "")
-      ).trim() || `Product ${PRODUCT_ID}`;
-
-    console.log("🛍️ Product:", productName);
-
-    await saveTrackedProduct(productName);
-
-    // ==================================================
-    // COOKIE
-    // ==================================================
-
-    await handleCookies(page);
-
-    // ==================================================
-    // PRICE AREA
-    // ==================================================
-
-    const priceArea = page.locator(".price-block");
-
-    await priceArea.waitFor({
-      state: "visible",
-      timeout: 10000,
-    });
-
-    console.log("💰 Price area found");
-
-    // ==================================================
-    // REVEAL BUTTON
-    // ==================================================
-
-    const revealButton = page.getByRole("button", {
-      name: /REVEAL PRICE/i,
-    });
-
-    await revealButton.waitFor({
-      state: "visible",
-      timeout: 10000,
-    });
-
-    console.log("💰 Reveal Price button found");
-
-    // ==================================================
-    // MOUSE INTERACTION
-    // ==================================================
-
-    const box = await priceArea.boundingBox();
-
-    if (!box) {
-      throw new Error("Could not find price area position");
-    }
-
-    console.log("📍 Price area position:", box);
-
-    const centerX = box.x + box.width / 2;
-
-    const centerY = box.y + box.height / 2;
-
-    console.log("🖱️ Starting mouse interaction...");
-
-    await page.mouse.move(box.x, box.y);
-
-    await page.mouse.move(box.x + box.width * 0.25, centerY, {
-      steps: 10,
-    });
-
-    await page.mouse.move(box.x + box.width * 0.5, centerY, {
-      steps: 10,
-    });
-
-    await page.mouse.move(box.x + box.width * 0.75, centerY, {
-      steps: 10,
-    });
-
-    await page.mouse.move(centerX, centerY, {
-      steps: 10,
-    });
-
-    console.log("🖱️ Mouse sweep completed");
-
-    // ==================================================
-    // WAIT FOR REVEAL BUTTON
-    // ==================================================
-
-    let buttonEnabled = false;
-
-    const revealStart = Date.now();
-
-    while (Date.now() - revealStart < 20000) {
-      // Cookie popup can appear at ANY time
-      await handleCookies(page);
-
-      // Keep interacting with price area
-      await page.mouse.move(centerX, centerY, {
-        steps: 3,
+    // Inject real-time MutationObserver to automatically click "ACCEPT"
+    // the very millisecond the cookie banner is attached to the DOM.
+    // The store's cookie popup requires up to 3 clicks to dismiss fully.
+    await page.addInitScript(() => {
+      const observer = new MutationObserver(() => {
+        const btns = Array.from(
+          document.querySelectorAll(".cookie-overlay button, .cookie-banner button"),
+        );
+        const acceptBtn = btns.find(
+          (b) => b.innerText && b.innerText.includes("ACCEPT"),
+        );
+        if (acceptBtn) {
+          acceptBtn.click();
+        }
       });
-
-      const disabled = await revealButton.isDisabled().catch(() => true);
-
-      if (!disabled) {
-        buttonEnabled = true;
-
-        console.log("✅ Reveal Price button enabled");
-
-        break;
-      }
-
-      console.log("⏳ Reveal Price still disabled...");
-
-      await page.waitForTimeout(500);
-    }
-
-    if (!buttonEnabled) {
-      throw new Error("Reveal Price button never became enabled");
-    }
-
-    // ==================================================
-    // CLICK REVEAL
-    // ==================================================
-
-    console.log("🍪 Final cookie check before Reveal...");
-    await handleCookies(page);
-
-    console.log("🖱️ Clicking Reveal Price...");
-
-    await revealButton.scrollIntoViewIfNeeded().catch(() => {});
-
-    await revealButton.click({
-      force: true,
-      timeout: 5000,
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
     });
 
-    console.log("🖱️ Reveal Price clicked successfully");
+    for (let cycle = 1; cycle <= MAX_CYCLES; cycle++) {
+      totalAttempts++;
+      console.log(`\n🔄 Scrape cycle ${cycle}/${MAX_CYCLES}...`);
 
-    await page.waitForTimeout(1000);
-
-    await handleCookies(page);
-
-    await revealButton.scrollIntoViewIfNeeded().catch(() => {});
-
-    await revealButton.click({
-      force: true,
-      timeout: 5000,
-    });
-
-    console.log("🖱️ Reveal Price clicked successfully");
-
-    await page.waitForTimeout(1000);
-
-    await handleCookies(page);
-
-    // ==================================================
-    // REAL ATTEMPTS
-    // ==================================================
-
-    while (attempt < MAX_ATTEMPTS) {
-      attempt++;
-
-      console.log("\n=================================");
-      console.log(`🔄 ATTEMPT ${attempt}/${MAX_ATTEMPTS}`);
-      console.log("📄 SAME browser + SAME page");
-      console.log("=================================");
-
-      const result = await waitForResult(page);
-
-      // ==================================================
-      // SUCCESS
-      // ==================================================
-
-      if (result.state === "success") {
-        const price = result.price;
-
-        console.log("\n💰 FINAL PRICE:", price);
-
-        const stock = await extractStock(page);
-
-        if (stock === null || !Number.isFinite(stock) || stock < 0) {
-          console.log("❌ Invalid stock");
-
-          await saveScrapeLog({
-            startedAt,
-            finishedAt: new Date().toISOString(),
-            status: "failed",
-            attempts: attempt,
-            price,
-            stock: null,
-            errorMessage: "Invalid stock",
-          });
-
-          return {
-            success: false,
-            price: null,
-            stock: null,
-          };
-        }
-
-        console.log("\n🎉 SCRAPING SUCCESSFUL");
-
-        console.log("💰 Price:", price);
-
-        console.log("📦 Stock:", stock);
-
-        console.log("🛑 NO MORE ATTEMPTS");
-
-        await savePriceHistory(price, stock);
-
-        await saveScrapeLog({
-          startedAt,
-          finishedAt: new Date().toISOString(),
-          status: "success",
-          attempts: attempt,
-          price,
-          stock,
+      try {
+        await page.goto(productUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 30000,
         });
 
-        return {
-          success: true,
-          price,
-          stock,
-        };
-      }
+        // Read and persist product name
+        const productName =
+          (
+            await page
+              .locator("h1")
+              .first()
+              .innerText()
+              .catch(() => "")
+          ).trim() || `Product ${productId}`;
 
-      // ==================================================
-      // TRY AGAIN
-      // ==================================================
+        console.log(`🛍️ Product: "${productName}"`);
+        await saveTrackedProduct(productId, productName, productUrl);
 
-      if (result.state === "retry") {
-        console.log("🔁 TRY AGAIN detected");
+        // Locate price block
+        const priceBlock = page.locator(".price-block");
+        await priceBlock.waitFor({ state: "visible", timeout: 15000 });
 
-        // IMPORTANT:
-        // Before clicking retry,
-        // check price ONE MORE TIME.
+        const box = await priceBlock.boundingBox();
+        if (!box) {
+          throw new Error("Price block position not found");
+        }
 
-        const finalPrice = await extractPrice(page);
+        console.log("📍 Simulating human mouse sweep across price area...");
 
-        if (finalPrice !== null && finalPrice > 0) {
-          console.log("🎯 Price appeared just before retry!");
+        // Site requirement: minMoves >= 8, interval >= 40ms, dwellMs >= 600ms
+        // We perform 16 moves across the box with 55ms delays (~900ms total hover)
+        await page.mouse.move(box.x + box.width * 0.15, box.y + box.height * 0.5);
+        await page.waitForTimeout(60);
 
-          const stock = await extractStock(page);
+        for (let i = 1; i <= 16; i++) {
+          const x = box.x + (box.width * i) / 17;
+          const y = box.y + (box.height * (i % 2 === 0 ? 0.35 : 0.65));
+          await page.mouse.move(x, y);
+          await page.waitForTimeout(55);
+        }
 
-          if (stock !== null && Number.isFinite(stock) && stock >= 0) {
-            await savePriceHistory(finalPrice, stock);
+        await page.waitForTimeout(250);
 
+        // Wait for the button to become enabled
+        await page.waitForFunction(
+          () => {
+            const btn = document.querySelector(".price-block button");
+            return btn && !btn.disabled;
+          },
+          { timeout: 10000 },
+        );
+
+        console.log("✅ Reveal Price button enabled. Clicking...");
+
+        // Click Reveal Price
+        const revealBtn = page.locator(".price-block button");
+        await revealBtn.click({ timeout: 5000 }).catch(async () => {
+          // If intercepted by any lingering overlay, force-click
+          await revealBtn.click({ force: true });
+        });
+
+        // Monitor DOM state and handle retries/timeouts
+        const cycleStart = Date.now();
+        let cycleDone = false;
+
+        while (Date.now() - cycleStart < PER_CYCLE_TIMEOUT_MS) {
+          await page.waitForTimeout(400);
+
+          const state = await page.evaluate(() => {
+            const pb = document.querySelector(".price-block");
+            if (!pb) return { phase: "unknown" };
+
+            // SUCCESS
+            if (pb.classList.contains("price-success")) {
+              const main = pb.querySelector(".price-main");
+              let sellingPrice = null;
+
+              if (main) {
+                // Filter out fake decoys (display: none), strikethrough MRP, and badges
+                for (const child of main.children) {
+                  const style = window.getComputedStyle(child);
+                  if (style.display === "none" || style.visibility === "hidden") continue;
+                  if (style.textDecorationLine.includes("line-through")) continue;
+
+                  const text = child.innerText || "";
+                  if (
+                    text.includes("% off") ||
+                    text.includes("Updating") ||
+                    text.includes("Deal price") ||
+                    text.includes("Price hidden")
+                  ) {
+                    continue;
+                  }
+
+                  const clean = text.replace(/[\u200B\u200C\u200D\uFEFF\xA0]/g, " ").trim();
+                  if (clean.includes("₹") || clean.includes("Rs.")) {
+                    sellingPrice = clean;
+                  }
+                }
+              }
+
+              const stockEl = document.querySelector(
+                ".stock-badge, [class*='stock'], [class*='st-']",
+              );
+
+              return {
+                phase: "success",
+                rawPrice: sellingPrice,
+                rawStock: stockEl ? stockEl.innerText.trim() : null,
+              };
+            }
+
+            // STORE INTERNAL ERROR / CHALLENGE FAILURE
+            if (pb.classList.contains("price-error")) {
+              const btn = pb.querySelector("button");
+              return {
+                phase: "error",
+                msg: pb.innerText.replace(/\n+/g, " "),
+                canRetry: btn && /try again/i.test(btn.innerText),
+              };
+            }
+
+            // IDLE OR LOADING/RETRYING
+            const btn = pb.querySelector("button");
+            return {
+              phase: pb.classList.contains("price-idle") ? "idle" : "loading",
+              statusText: pb.innerText.replace(/\n+/g, " "),
+              buttonText: btn ? btn.innerText : null,
+              buttonDisabled: btn ? btn.disabled : null,
+            };
+          });
+
+          // Handle Success
+          if (state.phase === "success") {
+            const price = parsePrice(state.rawPrice);
+            const stock = parseStock(state.rawStock);
+
+            if (price === null || stock === null) {
+              throw new Error(
+                `Price or stock parsing failed: rawPrice="${state.rawPrice}", rawStock="${state.rawStock}"`,
+              );
+            }
+
+            console.log("\n🎉 PRICE REVEALED SUCCESSFULLY!");
+            console.log(`💰 Current Selling Price: ₹${price}`);
+            console.log(`📦 Stock Quantity: ${stock}`);
+
+            await savePriceHistory(productId, price, stock);
             await saveScrapeLog({
+              productId,
               startedAt,
               finishedAt: new Date().toISOString(),
               status: "success",
-              attempts: attempt,
-              price: finalPrice,
+              attempts: totalAttempts,
+              price,
               stock,
             });
-          }
 
-          return {
-            success: true,
-            price: finalPrice,
-            stock,
-          };
-        }
-
-        const retryButton = page.getByRole("button", {
-          name: /TRY AGAIN/i,
-        });
-
-        console.log("🖱️ Clicking TRY AGAIN...");
-
-        await handleCookies(page);
-
-        await retryButton.click({ force: true });
-
-        await page.waitForTimeout(500);
-
-        console.log(`➡️ Starting NEW attempt: ${attempt + 1}`);
-
-        continue;
-      }
-
-      // ==================================================
-      // TIMEOUT
-      // ==================================================
-
-      if (result.state === "timeout") {
-        console.log("⏰ Current attempt timed out");
-
-        const finalPrice = await extractPrice(page);
-
-        if (finalPrice !== null && finalPrice > 0) {
-          console.log("🎯 Price appeared during timeout!");
-
-          const stock = await extractStock(page);
-
-          if (stock !== null && Number.isFinite(stock) && stock >= 0) {
-            await savePriceHistory(finalPrice, stock);
-
-            await saveScrapeLog({
-              startedAt,
-              finishedAt: new Date().toISOString(),
-              status: "success",
-              attempts: attempt,
-              price: finalPrice,
+            cycleDone = true;
+            return {
+              success: true,
+              productId,
+              price,
               stock,
-            });
+              attempts: totalAttempts,
+            };
           }
 
-          return {
-            success: true,
-            price: finalPrice,
-            stock,
-          };
+          // Handle Store Error: Click "Try again"
+          if (state.phase === "error" && state.canRetry) {
+            console.log(`⚠️ Store error detected: "${state.msg}". Clicking Try Again...`);
+            totalAttempts++;
+            const retryBtn = page.getByRole("button", { name: /try again/i });
+            await retryBtn.click({ force: true }).catch(() => {});
+            await page.waitForTimeout(1000);
+          }
+
+          // Handle missed click in idle phase
+          if (state.phase === "idle" && state.buttonDisabled === false) {
+            const idleBtn = page.locator(".price-block button");
+            await idleBtn.click({ force: true }).catch(() => {});
+            await page.waitForTimeout(500);
+          }
         }
 
-        const retryVisible = await isTryAgainVisible(page);
-
-        if (retryVisible) {
-          console.log("🔁 TRY AGAIN appeared after timeout");
-
-          const retryButton = page.getByRole("button", {
-            name: /TRY AGAIN/i,
-          });
-
-          await handleCookies(page);
-
-          await retryButton.click({ force: true });
-
-          await page.waitForTimeout(500);
-
-          continue;
+        if (!cycleDone) {
+          throw new Error("Timed out waiting for price state");
         }
-
-        console.log("⚠️ No price and no TRY AGAIN");
-
-        continue;
+      } catch (err) {
+        lastError = err.message;
+        console.warn(`⚠️ Cycle ${cycle} notice: ${err.message} (will retry if cycles remaining)`);
+        await page.waitForTimeout(1000);
       }
     }
 
-    console.log("\n❌ ALL ATTEMPTS FAILED");
-
+    // If all cycles exhausted
+    console.error(`\n❌ Scraper could not resolve price after ${MAX_CYCLES} cycles.`);
     await saveScrapeLog({
+      productId,
       startedAt,
       finishedAt: new Date().toISOString(),
       status: "failed",
-      attempts: attempt,
+      attempts: totalAttempts,
       price: null,
       stock: null,
-      errorMessage: "All scraping attempts failed",
+      errorMessage: lastError || "Failed after maximum retries",
     });
 
     return {
       success: false,
+      productId,
       price: null,
       stock: null,
-    };
-  } catch (error) {
-    console.log("\n💥 SCRAPER ERROR:", error.message);
-
-    await saveScrapeLog({
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      status: "failed",
-      attempts: attempt,
-      price: null,
-      stock: null,
-      errorMessage: error.message,
-    });
-
-    return {
-      success: false,
-      price: null,
-      stock: null,
-      error: error.message,
+      attempts: totalAttempts,
+      error: lastError,
     };
   } finally {
-    console.log("\n🔴 SCRAPER FINISHED");
-
-    console.log("🔴 Closing browser ONCE...");
-
-    await browser.close();
-
-    console.log("🔴 Browser closed");
+    console.log("🔴 Closing browser...");
+    await browser.close().catch(() => {});
   }
 }
 
-scrape();
+// CLI Execution Entrypoint
+if (require.main === module) {
+  scrapeProduct(targetUrl)
+    .then((result) => {
+      console.log("\nExecution completed with result:", result);
+      process.exit(result.success ? 0 : 1);
+    })
+    .catch((err) => {
+      console.error("Fatal exception:", err);
+      process.exit(1);
+    });
+}
+
+module.exports = { scrapeProduct, parsePrice, parseStock };

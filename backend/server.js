@@ -65,7 +65,7 @@ app.post("/api/scrape/:productId", async (req, res) => {
       });
     }
 
-    const scraper = spawn("node", ["scraper.js"], {
+    const scraper = spawn("node", ["scraper.js", product.product_url], {
       cwd: __dirname,
       env: {
         ...process.env,
@@ -94,6 +94,56 @@ app.post("/api/scrape/:productId", async (req, res) => {
     res.status(500).json({
       error: error.message,
     });
+  }
+});
+
+// ----------------------------------------
+// CRON / BULK SCRAPE ALL ACTIVE PRODUCTS
+// ----------------------------------------
+app.all(["/api/cron/scrape", "/api/scrape-all"], async (req, res) => {
+  try {
+    const cronSecret = process.env.CRON_SECRET;
+    const providedSecret = req.headers["x-cron-secret"] || req.query.secret;
+    if (cronSecret && providedSecret !== cronSecret) {
+      return res.status(401).json({ error: "Unauthorized cron trigger" });
+    }
+
+    const { data: products, error } = await supabase
+      .from("tracked_products")
+      .select("*")
+      .eq("is_active", true);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    if (!products || products.length === 0) {
+      return res.json({ message: "No active tracked products to scrape" });
+    }
+
+    console.log(`⏱️ Cron triggered: starting batch scrape for ${products.length} products`);
+
+    // Scrape sequentially in background so Render free-tier RAM isn't overloaded
+    (async () => {
+      const { scrapeProduct } = require("./scraper");
+      for (const p of products) {
+        try {
+          console.log(`⏱️ Batch scraping product ${p.product_id}...`);
+          await scrapeProduct(p.product_url);
+        } catch (err) {
+          console.error(`⏱️ Error scraping ${p.product_id}:`, err.message);
+        }
+      }
+      console.log(`✅ Batch scrape complete`);
+    })();
+
+    res.json({
+      message: "Scraping cycle started for active products",
+      count: products.length,
+      products: products.map((p) => ({ id: p.product_id, name: p.product_name })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -195,8 +245,66 @@ app.post("/api/products/track", async (req, res) => {
 });
 
 // ----------------------------------------
-// SEARCH PRODUCTS
+// UNTRACK PRODUCT
 // ----------------------------------------
+app.delete("/api/products/:productId", async (req, res) => {
+  try {
+    const { productId } = req.params;
+
+    const { data, error } = await supabase
+      .from("tracked_products")
+      .update({ is_active: false })
+      .eq("product_id", String(productId))
+      .select();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ message: "Product untracked successfully", product_id: productId });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ----------------------------------------
+// SEARCH PRODUCTS (Dynamic context with cancellation support)
+// ----------------------------------------
+let catalogCache = null;
+let catalogCacheTime = 0;
+const CATALOG_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+
+async function loadStoreCatalog(signal) {
+  const items = [];
+  for (let p = 1; p <= 20; p++) {
+    if (signal && signal.aborted) break;
+    const res = await fetch(
+      `https://demo.inelabteamdev.com/api/catalog?page=${p}&pageSize=60`,
+      { signal }
+    );
+    if (!res.ok) break;
+    const data = await res.json();
+    if (!data.items || data.items.length === 0) break;
+    items.push(...data.items);
+    if (data.page >= data.pages) break;
+  }
+  return items;
+}
+
+// Pre-warm catalog cache on server start
+(async () => {
+  try {
+    const items = await loadStoreCatalog();
+    if (items.length > 0) {
+      catalogCache = items;
+      catalogCacheTime = Date.now();
+      console.log(`📦 Catalog index pre-warmed with ${items.length} items`);
+    }
+  } catch (err) {
+    console.warn("⚠️ Catalog pre-warm skipped:", err.message);
+  }
+})();
+
 app.get("/api/search", async (req, res) => {
   const search = (req.query.q || "").trim().toLowerCase();
 
@@ -206,197 +314,197 @@ app.get("/api/search", async (req, res) => {
     });
   }
 
-  let browser;
+  let isAborted = false;
+  const abortController = new AbortController();
+  let browser = null;
+
+  // Detect when client modifies input or aborts previous query
+  req.on("close", () => {
+    if (!res.writableEnded) {
+      console.log(`⏹️ Client disconnected/aborted search for: "${search}"`);
+      isAborted = true;
+      abortController.abort();
+      if (browser) {
+        browser.close().catch(() => {});
+      }
+    }
+  });
 
   try {
+    // 1. Fast indexed search via store catalog
+    const now = Date.now();
+    if (!catalogCache || now - catalogCacheTime > CATALOG_CACHE_TTL) {
+      const items = await loadStoreCatalog(abortController.signal);
+      if (items.length > 0) {
+        catalogCache = items;
+        catalogCacheTime = now;
+      }
+    }
+
+    if (isAborted || req.destroyed) return;
+
+    if (catalogCache && catalogCache.length > 0) {
+      const matches = catalogCache.filter((item) => {
+        const name = (item.name || "").toLowerCase();
+        const brand = (item.brand || "").toLowerCase();
+        const category = (item.category || "").toLowerCase();
+        const sku = (item.sku || "").toLowerCase();
+        return (
+          name.includes(search) ||
+          brand.includes(search) ||
+          category.includes(search) ||
+          sku.includes(search)
+        );
+      });
+
+      // Fetch any existing recorded prices for these products from price_history
+      const pids = matches.slice(0, 50).map((item) => String(item.id));
+      let latestPricesMap = {};
+      try {
+        const { data: priceRows } = await supabase
+          .from("price_history")
+          .select("product_id, price, stock, scraped_at")
+          .in("product_id", pids)
+          .order("scraped_at", { ascending: false });
+
+        if (priceRows && priceRows.length > 0) {
+          priceRows.forEach((row) => {
+            if (!latestPricesMap[row.product_id]) {
+              latestPricesMap[row.product_id] = {
+                price: Number(row.price),
+                stock: row.stock,
+                scraped_at: row.scraped_at,
+              };
+            }
+          });
+        }
+      } catch (err) {
+        console.warn("⚠️ Price lookup for search skipped:", err.message);
+      }
+
+      const results = matches.slice(0, 50).map((item) => {
+        const pid = String(item.id);
+        const recorded = latestPricesMap[pid] || null;
+        return {
+          product_id: pid,
+          product_name: item.name,
+          product_url: `https://demo.inelabteamdev.com/product/${item.id}`,
+          brand: item.brand || "",
+          category: item.category || "",
+          sku: item.sku || "",
+          description: item.description || "",
+          price: recorded ? recorded.price : null,
+          stock: recorded ? recorded.stock : null,
+          last_scraped_at: recorded ? recorded.scraped_at : null,
+        };
+      });
+
+      if (isAborted || req.destroyed) return;
+
+      console.log(`🔍 Search "${search}": found ${results.length} matches (with product details & recorded prices)`);
+      return res.json(results);
+    }
+
+    // 2. Fallback to Playwright if catalog API is unavailable
+    if (isAborted || req.destroyed) return;
+
     browser = await chromium.launch({
       headless: true,
     });
 
+    if (isAborted || req.destroyed) return;
+
     const page = await browser.newPage();
 
-    // Handle cookie popup whenever it appears
-    const handleCookies = async () => {
-      const acceptButton = page.getByRole("button", {
-        name: "ACCEPT",
-        exact: true,
+    // In-browser cookie auto-accept
+    await page.addInitScript(() => {
+      const observer = new MutationObserver(() => {
+        const btn = Array.from(document.querySelectorAll("button")).find((b) =>
+          /accept/i.test(b.textContent || "")
+        );
+        if (btn && btn.offsetParent !== null) {
+          btn.click();
+        }
       });
-
-      if (await acceptButton.isVisible().catch(() => false)) {
-        console.log("🍪 Cookie popup found");
-        await acceptButton.click({ force: true }).catch(() => {});
-        await page.waitForTimeout(300);
-      }
-    };
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
+    });
 
     await page.goto("https://demo.inelabteamdev.com/", {
-      waitUntil: "networkidle",
+      waitUntil: "domcontentloaded",
       timeout: 30000,
     });
 
-    await handleCookies();
-
     const results = [];
 
-    for (let currentPage = 1; currentPage <= 50; currentPage++) {
-      console.log(`📄 Searching page ${currentPage}/50`);
-
-      await handleCookies();
+    for (let currentPage = 1; currentPage <= 20; currentPage++) {
+      if (isAborted || req.destroyed) break;
 
       await page
         .locator(".tile")
         .first()
-        .waitFor({
-          state: "visible",
-          timeout: 10000,
-        })
+        .waitFor({ state: "visible", timeout: 10000 })
         .catch(() => {});
 
       const cardCount = await page.locator(".tile").count();
 
-      console.log(`📦 Products on page: ${cardCount}`);
-
       for (let i = 0; i < cardCount; i++) {
-        await handleCookies();
+        if (isAborted || req.destroyed) break;
 
         const card = page.locator(".tile").nth(i);
         const nameLocator = card.locator(".tile-name");
 
-        if (!(await nameLocator.count())) {
-          continue;
-        }
+        if (!(await nameLocator.count())) continue;
 
         const productName = (await nameLocator.innerText()).trim();
 
-        if (!productName.toLowerCase().includes(search)) {
-          continue;
-        }
+        if (!productName.toLowerCase().includes(search)) continue;
 
-        console.log(`🎯 Match found: ${productName}`);
-
-        await handleCookies();
-
-        const button = page.locator(".tile").nth(i).locator(".tile-cta");
-
+        const button = card.locator(".tile-cta");
         await button.click({ force: true });
-
-        await page.waitForTimeout(1000);
+        await page.waitForTimeout(600);
 
         let productUrl = page.url();
-
-        // Retry if product page did not open
-        if (!productUrl.includes("/product/")) {
-          console.log("⚠️ Product page did not open, retrying...");
-
-          await handleCookies();
-
-          const retryButton = page
-            .locator(".tile")
-            .nth(i)
-            .locator(".tile-cta");
-
-          await retryButton.click({ force: true });
-
-          await page.waitForTimeout(1500);
-
-          productUrl = page.url();
+        if (productUrl.includes("/product/")) {
+          const productId = productUrl.split("/product/").pop().split("/").shift();
+          if (productId) {
+            results.push({
+              product_id: productId,
+              product_name: productName,
+              product_url: productUrl,
+            });
+          }
+          await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
         }
-
-        if (!productUrl.includes("/product/")) {
-          console.log(`❌ Could not open: ${productName}`);
-
-          await page.goBack({
-            waitUntil: "networkidle",
-          }).catch(() => {});
-
-          continue;
-        }
-
-        const productId = productUrl
-          .split("/product/")
-          .pop()
-          .split("/")
-          .shift();
-
-        console.log(`🔗 Product URL: ${productUrl}`);
-
-        if (productId) {
-          results.push({
-            product_id: productId,
-            product_name: productName,
-            product_url: productUrl,
-          });
-        }
-
-        // Return to product listing
-        await page.goBack({
-          waitUntil: "networkidle",
-        });
-
-        await page
-          .locator(".tile")
-          .first()
-          .waitFor({
-            state: "visible",
-            timeout: 10000,
-          })
-          .catch(() => {});
-
-        await page.waitForTimeout(500);
       }
 
-      // If matches found, return them
-      if (results.length > 0) {
+      if (results.length > 0 || isAborted || req.destroyed) break;
+
+      // Next page
+      const nextBtn = page.locator("button").filter({ hasText: /NEXT/i }).last();
+      if ((await nextBtn.count()) && (await nextBtn.isVisible().catch(() => false))) {
+        await nextBtn.click({ force: true });
+        await page.waitForTimeout(600);
+      } else {
         break;
-      }
-
-      // ----------------------------------------
-      // NEXT PAGE
-      // ----------------------------------------
-      if (currentPage < 50) {
-        await handleCookies();
-
-        const nextButton = page
-          .locator("button")
-          .filter({ hasText: /NEXT/i })
-          .last();
-
-        const nextExists = await nextButton.count();
-
-        if (!nextExists) {
-          console.log("❌ NEXT button not found");
-          break;
-        }
-
-        if (!(await nextButton.isVisible().catch(() => false))) {
-          console.log("❌ NEXT button not visible");
-          break;
-        }
-
-        if (await nextButton.isDisabled().catch(() => false)) {
-          console.log("❌ NEXT button disabled");
-          break;
-        }
-
-        await nextButton.click({ force: true });
-
-        await page.waitForTimeout(1000);
       }
     }
 
-    console.log("🔍 Search:", search);
-    console.log("✅ Results:", results);
+    if (isAborted || req.destroyed) return;
 
-    res.json(results);
-
+    return res.json(results);
   } catch (error) {
+    if (isAborted || error.name === "AbortError" || req.destroyed) {
+      console.log(`⏹️ Search cleanly aborted for: "${search}"`);
+      return;
+    }
     console.error("Search failed:", error.message);
-
     res.status(500).json({
       error: "Failed to search products",
       message: error.message,
     });
-
   } finally {
     if (browser) {
       await browser.close().catch(() => {});
