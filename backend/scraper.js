@@ -95,10 +95,35 @@ function parseStock(raw) {
 
 async function saveTrackedProduct(productId, productName, productUrl) {
   try {
+    let finalName = (productName || "").trim();
+
+    // Safeguard: If incoming name is empty or a generic fallback ("Product 187"),
+    // check if Supabase already has an authentic name so we never overwrite good data.
+    if (!finalName || /^product\s+\d+$/i.test(finalName)) {
+      const { data: existing } = await supabase
+        .from("tracked_products")
+        .select("product_name")
+        .eq("product_id", String(productId))
+        .single();
+
+      if (
+        existing &&
+        existing.product_name &&
+        !/^product\s+\d+$/i.test(existing.product_name.trim())
+      ) {
+        finalName = existing.product_name.trim();
+        console.log(`🛡️ Preserved existing authentic product name: "${finalName}"`);
+      }
+    }
+
+    if (!finalName) {
+      finalName = `Product ${productId}`;
+    }
+
     const { error } = await supabase.from("tracked_products").upsert(
       {
         product_id: String(productId),
-        product_name: productName,
+        product_name: finalName,
         product_url: productUrl,
         is_active: true,
       },
@@ -108,7 +133,7 @@ async function saveTrackedProduct(productId, productName, productUrl) {
     if (error) {
       console.warn("⚠️ Database warning on tracked_products:", error.message);
     } else {
-      console.log(`🗄️ Tracked product persisted (${productId}: "${productName}")`);
+      console.log(`🗄️ Tracked product persisted (${productId}: "${finalName}")`);
     }
   } catch (err) {
     console.warn("⚠️ Database exception on tracked_products:", err.message);
@@ -292,15 +317,40 @@ async function scrapeProduct(productUrl = targetUrl) {
           console.warn(`⚠️ DOM Drift Warning: missing ${domAudit.missing.join(", ")}`);
         }
 
-        // Read and persist product name
-        const productName =
-          (
-            await page
-              .locator("h1")
-              .first()
-              .innerText()
-              .catch(() => "")
-          ).trim() || `Product ${productId}`;
+        // Read and persist product name with multi-tier resolution
+        let productName = "";
+        try {
+          await page.waitForSelector("h1", { state: "visible", timeout: 5000 }).catch(() => {});
+          productName = (await page.locator("h1").first().innerText().catch(() => "")).trim();
+        } catch (_) {}
+
+        // If empty or generic ("Product 187"), resolve real name from store API
+        if (!productName || /^product\s+\d+$/i.test(productName)) {
+          try {
+            const apiRes = await fetch(`https://demo.inelabteamdev.com/api/product/${productId}`);
+            if (apiRes.ok) {
+              const apiData = await apiRes.json();
+              if (apiData && apiData.name) {
+                productName = apiData.name.trim();
+                console.log(`🛍️ Resolved product name from store API: "${productName}"`);
+              }
+            }
+          } catch (_) {}
+        }
+
+        // Additional fallback: document title
+        if (!productName || /^product\s+\d+$/i.test(productName)) {
+          try {
+            const pageTitle = (await page.title().catch(() => "")).trim();
+            if (pageTitle && !pageTitle.toLowerCase().includes("store") && !pageTitle.toLowerCase().includes("demo")) {
+              productName = pageTitle;
+            }
+          } catch (_) {}
+        }
+
+        if (!productName) {
+          productName = `Product ${productId}`;
+        }
 
         console.log(`🛍️ Product: "${productName}"`);
         await saveTrackedProduct(productId, productName, productUrl);

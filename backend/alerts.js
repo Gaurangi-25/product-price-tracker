@@ -91,6 +91,21 @@ async function sendSendGridAlert(alert) {
  */
 async function evaluateAndRecordAlerts({ productId, productName, newPrice, newStock }) {
   try {
+    let resolvedName = (productName || "").trim();
+    if (!resolvedName || /^product\s+\d+$/i.test(resolvedName)) {
+      const { data: tp } = await supabase
+        .from("tracked_products")
+        .select("product_name")
+        .eq("product_id", String(productId))
+        .single();
+      if (tp && tp.product_name && !/^product\s+\d+$/i.test(tp.product_name.trim())) {
+        resolvedName = tp.product_name.trim();
+      }
+    }
+    if (!resolvedName) {
+      resolvedName = `Product ${productId}`;
+    }
+
     // Fetch last 2 price history entries to see the change
     const { data: history, error } = await supabase
       .from("price_history")
@@ -122,7 +137,7 @@ async function evaluateAndRecordAlerts({ productId, productName, newPrice, newSt
         id: `alert-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
         type: "price_drop",
         productId: String(productId),
-        productName: productName || `Product ${productId}`,
+        productName: resolvedName,
         oldPrice: prevPrice,
         newPrice: currentPrice,
         diff,
@@ -143,7 +158,7 @@ async function evaluateAndRecordAlerts({ productId, productName, newPrice, newSt
         id: `alert-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
         type: "back_in_stock",
         productId: String(productId),
-        productName: productName || `Product ${productId}`,
+        productName: resolvedName,
         oldStock: prevStock,
         newStock: currentStock,
         price: currentPrice,
@@ -178,11 +193,25 @@ async function getAlerts() {
 
   // Pre-seed from price_history if in-memory list was cleared on server restart
   try {
-    const { data: rows } = await supabase
-      .from("price_history")
-      .select("product_id, price, stock, scraped_at")
-      .order("scraped_at", { ascending: false })
-      .limit(100);
+    const [{ data: rows }, { data: tracked }] = await Promise.all([
+      supabase
+        .from("price_history")
+        .select("product_id, price, stock, scraped_at")
+        .order("scraped_at", { ascending: false })
+        .limit(100),
+      supabase
+        .from("tracked_products")
+        .select("product_id, product_name"),
+    ]);
+
+    const productNameMap = {};
+    if (tracked && Array.isArray(tracked)) {
+      tracked.forEach((t) => {
+        if (t.product_name && !/^product\s+\d+$/i.test(t.product_name.trim())) {
+          productNameMap[String(t.product_id)] = t.product_name.trim();
+        }
+      });
+    }
 
     if (rows && rows.length > 1) {
       // Group by product_id
@@ -198,12 +227,14 @@ async function getAlerts() {
           const prev = entries[1];
           const curP = Number(cur.price);
           const prevP = Number(prev.price);
+          const pName = productNameMap[String(pid)] || `Product ${pid}`;
+
           if (curP < prevP) {
             recentAlerts.push({
               id: `alert-seed-${pid}-${Date.now()}`,
               type: "price_drop",
               productId: pid,
-              productName: `Product ${pid}`,
+              productName: pName,
               oldPrice: prevP,
               newPrice: curP,
               diff: prevP - curP,
@@ -218,7 +249,7 @@ async function getAlerts() {
               id: `alert-seed-stock-${pid}-${Date.now()}`,
               type: "back_in_stock",
               productId: pid,
-              productName: `Product ${pid}`,
+              productName: pName,
               oldStock: prev.stock,
               newStock: cur.stock,
               price: curP,

@@ -24,7 +24,85 @@ app.get("/", (req, res) => {
 });
 
 // ----------------------------------------
-// GET TRACKED PRODUCTS
+// STORE CATALOG CACHE & PRODUCT NAME RESOLVER
+// ----------------------------------------
+let catalogCache = null;
+let catalogCacheTime = 0;
+const CATALOG_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+
+async function loadStoreCatalog(signal) {
+  const items = [];
+  for (let p = 1; p <= 20; p++) {
+    if (signal && signal.aborted) break;
+    try {
+      const res = await fetch(
+        `https://demo.inelabteamdev.com/api/catalog?page=${p}&pageSize=60`,
+        { signal },
+      );
+      if (!res.ok) break;
+      const data = await res.json();
+      if (!data.items || data.items.length === 0) break;
+      items.push(...data.items);
+      if (data.page >= data.pages) break;
+    } catch (_) {
+      break;
+    }
+  }
+  return items;
+}
+
+// Pre-warm catalog cache on server start
+(async () => {
+  try {
+    const items = await loadStoreCatalog();
+    if (items.length > 0) {
+      catalogCache = items;
+      catalogCacheTime = Date.now();
+      console.log(`📦 Catalog index pre-warmed with ${items.length} items`);
+    }
+  } catch (err) {
+    console.warn("⚠️ Catalog pre-warm skipped:", err.message);
+  }
+})();
+
+/**
+ * Resolves a product's real human-readable title.
+ * If given name is already valid (not empty and not "Product <id>"), returns it.
+ * Otherwise, checks catalog cache, then store API.
+ */
+async function resolveProductName(productId, fallbackName) {
+  const isGeneric = !fallbackName || /^product\s+\d+$/i.test(String(fallbackName).trim());
+  if (!isGeneric) {
+    return String(fallbackName).trim();
+  }
+
+  const pid = String(productId).trim();
+
+  // 1. Check in-memory catalog cache
+  if (catalogCache && catalogCache.length > 0) {
+    const item = catalogCache.find((i) => String(i.id) === pid);
+    if (item && item.name) {
+      return item.name.trim();
+    }
+  }
+
+  // 2. Fetch from store product API
+  try {
+    const res = await fetch(`https://demo.inelabteamdev.com/api/product/${pid}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.name) {
+        return data.name.trim();
+      }
+    }
+  } catch (_) {}
+
+  // 3. Fallback
+  return fallbackName || `Product ${pid}`;
+}
+
+// ----------------------------------------
+// GET TRACKED PRODUCTS (with self-healing product names)
 // ----------------------------------------
 app.get("/api/products", async (req, res) => {
   try {
@@ -40,11 +118,45 @@ app.get("/api/products", async (req, res) => {
       });
     }
 
-    const enhanced = (data || []).map((p) => ({
-      ...p,
-      scrape_interval_minutes:
-        productFrequencyMap[String(p.product_id)] || p.scrape_interval_minutes || 120,
-    }));
+    const enhanced = await Promise.all(
+      (data || []).map(async (p) => {
+        let productName = p.product_name;
+        const isGeneric =
+          !productName || /^product\s+\d+$/i.test(String(productName).trim());
+
+        if (isGeneric) {
+          const resolved = await resolveProductName(p.product_id, productName);
+          if (resolved && !/^product\s+\d+$/i.test(resolved)) {
+            productName = resolved;
+            // Self-heal asynchronously in Supabase
+            supabase
+              .from("tracked_products")
+              .update({ product_name: resolved })
+              .eq("product_id", String(p.product_id))
+              .then(() =>
+                console.log(
+                  `🩹 Auto-healed product name for ${p.product_id}: "${resolved}"`
+                )
+              )
+              .catch((err) =>
+                console.warn(
+                  `⚠️ Failed to heal product ${p.product_id}:`,
+                  err.message
+                )
+              );
+          }
+        }
+
+        return {
+          ...p,
+          product_name: productName,
+          scrape_interval_minutes:
+            productFrequencyMap[String(p.product_id)] ||
+            p.scrape_interval_minutes ||
+            120,
+        };
+      })
+    );
 
     res.json(enhanced);
   } catch (error) {
@@ -249,13 +361,16 @@ app.get("/api/products/:productId/logs", async (req, res) => {
 // ----------------------------------------
 app.post("/api/products/track", async (req, res) => {
   try {
-    const { product_id, product_name, product_url } = req.body;
+    let { product_id, product_name, product_url } = req.body;
 
-    if (!product_id || !product_name || !product_url) {
+    if (!product_id || !product_url) {
       return res.status(400).json({
-        error: "product_id, product_name and product_url are required",
+        error: "product_id and product_url are required",
       });
     }
+
+    // Resolve real authentic title if missing or placeholder ("Product 187")
+    product_name = await resolveProductName(product_id, product_name);
 
     const { data, error } = await supabase
       .from("tracked_products")
@@ -461,40 +576,6 @@ app.get("/api/products/:productId/details", async (req, res) => {
 // ----------------------------------------
 // SEARCH PRODUCTS (Dynamic context with cancellation support)
 // ----------------------------------------
-let catalogCache = null;
-let catalogCacheTime = 0;
-const CATALOG_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
-
-async function loadStoreCatalog(signal) {
-  const items = [];
-  for (let p = 1; p <= 20; p++) {
-    if (signal && signal.aborted) break;
-    const res = await fetch(
-      `https://demo.inelabteamdev.com/api/catalog?page=${p}&pageSize=60`,
-      { signal },
-    );
-    if (!res.ok) break;
-    const data = await res.json();
-    if (!data.items || data.items.length === 0) break;
-    items.push(...data.items);
-    if (data.page >= data.pages) break;
-  }
-  return items;
-}
-
-// Pre-warm catalog cache on server start
-(async () => {
-  try {
-    const items = await loadStoreCatalog();
-    if (items.length > 0) {
-      catalogCache = items;
-      catalogCacheTime = Date.now();
-      console.log(`📦 Catalog index pre-warmed with ${items.length} items`);
-    }
-  } catch (err) {
-    console.warn("⚠️ Catalog pre-warm skipped:", err.message);
-  }
-})();
 
 app.get("/api/search", async (req, res) => {
   const search = (req.query.q || "").trim().toLowerCase();

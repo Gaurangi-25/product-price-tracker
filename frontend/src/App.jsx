@@ -224,7 +224,19 @@ function App() {
 
   // Modal inspection state
   const [modalProduct, setModalProduct] = useState(null); // product object
-  const [modalTab, setModalTab] = useState("history"); // 'history' | 'logs'
+  const [modalTab, setModalTab] = useState("history"); // 'history' | 'logs' | 'specs'
+
+  // Extension features states
+  const [alerts, setAlerts] = useState([]);
+  const [showAlertsDrawer, setShowAlertsDrawer] = useState(false);
+  const [systemHealth, setSystemHealth] = useState({
+    status: "healthy",
+    domHealth: { status: "stable", details: "All store structure anchors intact" },
+  });
+  const [statusFilter, setStatusFilter] = useState("all"); // 'all' | 'in_stock' | 'out_of_stock' | 'price_drop'
+  const [sortBy, setSortBy] = useState("recent"); // 'recent' | 'discount' | 'price_asc' | 'price_desc' | 'name'
+  const [productDetails, setProductDetails] = useState({}); // { [productId]: detailsData }
+  const [loadingDetails, setLoadingDetails] = useState(false);
 
   // Cancellation and debounce refs
   const searchAbortControllerRef = useRef(null);
@@ -306,7 +318,18 @@ function App() {
       const data = await response.json();
 
       if (response.ok && Array.isArray(data)) {
-        setTrackedProducts(data);
+        const withSavedFreq = data.map((p) => {
+          let freq = p.scrape_interval_minutes;
+          try {
+            const saved = localStorage.getItem(`scrape_freq_${p.product_id}`);
+            if (saved) freq = parseInt(saved, 10);
+          } catch (_) {}
+          return {
+            ...p,
+            scrape_interval_minutes: freq || 120,
+          };
+        });
+        setTrackedProducts(withSavedFreq);
         data.forEach((p) => {
           loadProductHistory(p.product_id);
           loadProductLogs(p.product_id);
@@ -320,6 +343,110 @@ function App() {
     }
   }, [loadProductHistory, loadProductLogs]);
 
+  const loadAlerts = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/alerts`);
+      if (res.ok) {
+        const data = await res.json();
+        setAlerts(Array.isArray(data) ? data : []);
+      }
+    } catch (e) {
+      console.warn("Alerts fetch notice:", e.message);
+    }
+  }, []);
+
+  const loadHealth = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/system/health`);
+      if (res.ok) {
+        const data = await res.json();
+        setSystemHealth(data);
+      }
+    } catch (e) {
+      console.warn("Health check notice:", e.message);
+    }
+  }, []);
+
+  const markAllAlertsRead = async () => {
+    try {
+      await fetch(`${API_URL}/api/alerts/mark-read`, { method: "POST" });
+      setAlerts((prev) => prev.map((a) => ({ ...a, read: true })));
+    } catch (e) {
+      console.warn("Mark alerts read notice:", e.message);
+    }
+  };
+
+  const handleFrequencyChange = async (productId, interval) => {
+    const mins = parseInt(interval, 10) || 120;
+
+    // 1. Instant optimistic UI update (never sticks or jumps back)
+    setTrackedProducts((prev) =>
+      prev.map((p) =>
+        String(p.product_id) === String(productId)
+          ? { ...p, scrape_interval_minutes: mins }
+          : p,
+      ),
+    );
+
+    // 2. Persist locally in browser storage immediately
+    try {
+      localStorage.setItem(`scrape_freq_${productId}`, String(mins));
+    } catch (_) {}
+
+    const label = mins < 60 ? `${mins}m` : `${mins / 60}h`;
+    showNotification(`Scrape frequency updated to every ${label}`, "info");
+
+    // 3. Sync to backend API in background
+    try {
+      await fetch(`${API_URL}/api/products/${productId}/frequency`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ interval: mins }),
+      });
+    } catch (err) {
+      console.warn("Backend frequency sync notice:", err.message);
+    }
+  };
+
+  const loadProductDetails = useCallback(
+    async (productId, force = false) => {
+      if (!force && productDetails[productId]) return;
+      try {
+        setLoadingDetails(true);
+        const res = await fetch(`${API_URL}/api/products/${productId}/details`);
+        if (res.ok) {
+          const data = await res.json();
+          setProductDetails((prev) => ({ ...prev, [productId]: data }));
+          if (data && data.name) {
+            setModalProduct((prev) => {
+              if (
+                prev &&
+                String(prev.product_id) === String(productId) &&
+                (!prev.product_name || /^product\s+\d+$/i.test(prev.product_name))
+              ) {
+                return { ...prev, product_name: data.name };
+              }
+              return prev;
+            });
+            setTrackedProducts((prev) =>
+              prev.map((p) =>
+                String(p.product_id) === String(productId) &&
+                (!p.product_name || /^product\s+\d+$/i.test(p.product_name))
+                  ? { ...p, product_name: data.name }
+                  : p
+              )
+            );
+          }
+        }
+      } catch (err) {
+        console.error("Failed to load product details:", err);
+      } finally {
+        setLoadingDetails(false);
+      }
+    },
+    [productDetails],
+  );
+
   useEffect(() => {
     let ignore = false;
     async function init() {
@@ -327,7 +454,18 @@ function App() {
         const response = await fetch(`${API_URL}/api/products`);
         const data = await response.json();
         if (!ignore && response.ok && Array.isArray(data)) {
-          setTrackedProducts(data);
+          const withSavedFreq = data.map((p) => {
+            let freq = p.scrape_interval_minutes;
+            try {
+              const saved = localStorage.getItem(`scrape_freq_${p.product_id}`);
+              if (saved) freq = parseInt(saved, 10);
+            } catch (_) {}
+            return {
+              ...p,
+              scrape_interval_minutes: freq || 120,
+            };
+          });
+          setTrackedProducts(withSavedFreq);
           data.forEach((p) => {
             loadProductHistory(p.product_id);
             loadProductLogs(p.product_id);
@@ -338,12 +476,14 @@ function App() {
       } finally {
         if (!ignore) setLoadingProducts(false);
       }
+      loadAlerts();
+      loadHealth();
     }
     init();
     return () => {
       ignore = true;
     };
-  }, [loadProductHistory, loadProductLogs]);
+  }, [loadProductHistory, loadProductLogs, loadAlerts, loadHealth]);
 
   // ----------------------------------------------------
   // DYNAMIC SEARCH ACTIONS
@@ -485,7 +625,7 @@ function App() {
   const handleScrapeNow = async (productId) => {
     try {
       setScrapingStatus((prev) => ({ ...prev, [productId]: true }));
-      showNotification(`Scraper triggered for product ${productId}...`, "info");
+      showNotification(`Scraper running for product ${productId}...`, "info");
 
       const response = await fetch(`${API_URL}/api/scrape/${productId}`, {
         method: "POST",
@@ -493,39 +633,20 @@ function App() {
       const data = await response.json();
 
       if (!response.ok) {
-        showNotification(data.error || "Failed to start scraper", "error");
-        setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
-        return;
+        showNotification(data.error || `Scraping failed for product ${productId}`, "error");
+        await loadProductLogs(productId);
+      } else {
+        showNotification(`Updated latest data for product ${productId}!`, "success");
+        await loadProductHistory(productId);
+        await loadProductLogs(productId);
+        await loadTrackedProducts();
+        await loadAlerts();
       }
-
-      // Poll periodically to catch the newly saved price & log rows
-      const pollIntervals = [3000, 7000, 12000, 18000, 24000];
-      pollIntervals.forEach((delay, idx) => {
-        setTimeout(async () => {
-          const history = await loadProductHistory(productId);
-          const logs = await loadProductLogs(productId);
-
-          if (idx === pollIntervals.length - 1) {
-            setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
-            if (history && history.length > 0) {
-              showNotification(`Updated latest data for product ${productId}`, "success");
-            } else if (logs && logs.length > 0) {
-              const latestLog = logs[0];
-              if (latestLog.status === "failed") {
-                showNotification(`Scrape failed for product ${productId}: ${latestLog.error_message || "Check logs"}`, "error");
-              } else {
-                showNotification(`Scrape finished for product ${productId}`, "success");
-              }
-            } else {
-              showNotification(`Scrape request submitted for product ${productId}. Refresh shortly.`, "info");
-            }
-          }
-        }, delay);
-      });
     } catch (error) {
       console.error("Scrape trigger failed:", error);
+      showNotification("Could not complete scraper process.", "error");
+    } finally {
       setScrapingStatus((prev) => ({ ...prev, [productId]: false }));
-      showNotification("Could not trigger scraper process.", "error");
     }
   };
 
@@ -534,15 +655,20 @@ function App() {
     setModalTab(tab);
     loadProductHistory(product.product_id);
     loadProductLogs(product.product_id);
+    if (tab === "specs") {
+      loadProductDetails(product.product_id);
+    }
   };
 
   // ----------------------------------------------------
-  // DASHBOARD SUMMARY METRICS
+  // DASHBOARD SUMMARY METRICS & CROSS-CATALOG KPIS
   // ----------------------------------------------------
   const totalTracked = trackedProducts.length;
   let inStockCount = 0;
   let outOfStockCount = 0;
   let latestSyncTime = null;
+  let activePriceDropsCount = 0;
+  let maxDiscountPercent = 0;
 
   trackedProducts.forEach((p) => {
     const history = productHistory[p.product_id] || [];
@@ -557,6 +683,24 @@ function App() {
       if (!latestSyncTime || syncDate > latestSyncTime) {
         latestSyncTime = syncDate;
       }
+
+      // Check price drop vs history peak or previous entry
+      const prices = history
+        .map((h) => Number(h.price))
+        .filter((v) => Number.isFinite(v) && v > 0);
+      if (prices.length >= 2) {
+        const highestPrice = Math.max(...prices);
+        const currentP = prices[prices.length - 1];
+        if (currentP < highestPrice) {
+          activePriceDropsCount++;
+          const discountPct = Math.round(
+            ((highestPrice - currentP) / highestPrice) * 100,
+          );
+          if (discountPct > maxDiscountPercent) {
+            maxDiscountPercent = discountPct;
+          }
+        }
+      }
     }
   });
 
@@ -568,15 +712,139 @@ function App() {
       })
     : "Never";
 
+  const unreadAlertsCount = alerts.filter((a) => !a.read).length;
+
   // ----------------------------------------------------
   // RENDER
   // ----------------------------------------------------
 
   return (
     <div className="dashboard-container">
-      {/* Header with Dashboard Summary */}
+      {/* Header with Dashboard Summary & Extension Actions */}
       <header className="dashboard-header">
-        <h1>Product Price Tracker</h1>
+        <div className="header-top-row">
+          <h1>Product Price Tracker</h1>
+
+          <div className="header-actions-group">
+            {/* System / Store DOM Health Badge */}
+            <div
+              className={`health-pill ${systemHealth.status}`}
+              title={
+                systemHealth.domHealth?.details ||
+                "Store structure selectors intact"
+              }
+            >
+              <span className="health-dot"></span>
+              <span>
+                {systemHealth.domHealth?.status === "stable"
+                  ? "Store DOM Stable"
+                  : "DOM Drift Detected"}
+              </span>
+            </div>
+
+            {/* In-App Alerts Bell Button */}
+            <button
+              className={`alerts-bell-btn ${showAlertsDrawer ? "active" : ""}`}
+              onClick={() => setShowAlertsDrawer((prev) => !prev)}
+              title="View Price Drop & Restock Alerts"
+              aria-label="Alerts"
+            >
+              <svg
+                className="bell-icon"
+                width="17"
+                height="17"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+              </svg>
+              {unreadAlertsCount > 0 && (
+                <span className="alerts-badge">
+                  <span className="alerts-badge-ping"></span>
+                  <span className="alerts-badge-count">{unreadAlertsCount}</span>
+                </span>
+              )}
+            </button>
+
+            {/* Alerts Dropdown Drawer */}
+            {showAlertsDrawer && (
+              <div className="alerts-dropdown">
+                <div className="alerts-header">
+                  <div className="alerts-header-title">
+                    <h4>Activity & Price Alerts</h4>
+                    <span className="alerts-count-chip">{alerts.length}</span>
+                  </div>
+                  {unreadAlertsCount > 0 && (
+                    <button className="btn-mark-all-read" onClick={markAllAlertsRead}>
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                      </svg>
+                      <span>Mark all read</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="alerts-list">
+                  {alerts.length === 0 ? (
+                    <div className="alerts-empty">
+                      No alerts triggered yet. Price drops and restocks will
+                      appear here.
+                    </div>
+                  ) : (
+                    alerts.map((alert) => (
+                      <div
+                        className={`alert-item ${!alert.read ? "unread" : ""}`}
+                        key={alert.id}
+                      >
+                        <div className="alert-item-header">
+                          <span className={`alert-tag ${alert.type}`}>
+                            {alert.type === "price_drop"
+                              ? `📉 Price Drop -${alert.percentDrop}%`
+                              : "🟢 Back In Stock"}
+                          </span>
+                          <span className="alert-time">
+                            {new Date(alert.timestamp).toLocaleTimeString(
+                              "en-IN",
+                              {
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              },
+                            )}
+                          </span>
+                        </div>
+                        <div className="alert-product-title">
+                          {alert.productName}
+                        </div>
+                        <div className="alert-item-body">
+                          {alert.type === "price_drop" ? (
+                            <>
+                              Now{" "}
+                              <span className="alert-new-price">
+                                ₹{Number(alert.newPrice).toLocaleString("en-IN")}
+                              </span>
+                              <span className="alert-old-price">
+                                ₹{Number(alert.oldPrice).toLocaleString("en-IN")}
+                              </span>
+                            </>
+                          ) : (
+                            <span>{alert.newStock} units available in store</span>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Dashboard Summary KPIs */}
         <div className="dashboard-summary-bar">
           <div className="summary-metric">
             <span className="summary-value">{totalTracked}</span>
@@ -591,6 +859,11 @@ function App() {
           <div className="summary-metric">
             <span className="summary-value out-stock">{outOfStockCount}</span>
             <span className="summary-label">Out of Stock</span>
+          </div>
+          <span className="summary-divider">•</span>
+          <div className="summary-metric">
+            <span className="summary-value green">{activePriceDropsCount}</span>
+            <span className="summary-label">Active Price Drops</span>
           </div>
           <span className="summary-divider">•</span>
           <div className="summary-metric">
@@ -637,9 +910,22 @@ function App() {
           <button
             type="submit"
             disabled={searching || !query.trim()}
-            className="btn btn-primary"
+            className="btn-search-submit"
           >
-            {searching ? "Searching..." : "Search"}
+            {searching ? (
+              <>
+                <span className="btn-spinner"></span>
+                <span>Searching...</span>
+              </>
+            ) : (
+              <>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="11" cy="11" r="8"></circle>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                <span>Search</span>
+              </>
+            )}
           </button>
         </form>
 
@@ -755,30 +1041,72 @@ function App() {
                           <button
                             onClick={() => handleScrapeNow(product.product_id)}
                             disabled={isScraping}
-                            className="btn btn-sm btn-primary"
+                            className="btn-card-scrape"
+                            title="Scrape price & stock now"
                           >
-                            {isScraping ? "Scraping..." : "Scrape Now"}
+                            {isScraping ? (
+                              <>
+                                <span className="btn-spinner"></span>
+                                <span>Scraping...</span>
+                              </>
+                            ) : (
+                              <>
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round">
+                                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                                </svg>
+                                <span>Scrape Now</span>
+                              </>
+                            )}
                           </button>
-                          <button
-                            onClick={() => openProductModal(product, "history")}
-                            className="btn btn-sm btn-outline"
-                          >
-                            History & Graph ({history.length})
-                          </button>
-                          <button
-                            onClick={() => openProductModal(product, "logs")}
-                            className="btn btn-sm btn-outline"
-                          >
-                            Logs ({logs.length})
-                          </button>
+                          <div className="card-secondary-actions">
+                            <button
+                              onClick={() => openProductModal(product, "history")}
+                              className="btn-card-action"
+                              title="View price history chart"
+                            >
+                              <span className="action-icon">📈</span>
+                              <span>History</span>
+                              {history.length > 0 && <span className="btn-badge">{history.length}</span>}
+                            </button>
+                            <button
+                              onClick={() => openProductModal(product, "logs")}
+                              className="btn-card-action"
+                              title="View scraper run logs"
+                            >
+                              <span className="action-icon">📋</span>
+                              <span>Logs</span>
+                              {logs.length > 0 && <span className="btn-badge">{logs.length}</span>}
+                            </button>
+                            <button
+                              onClick={() => openProductModal(product, "specs")}
+                              className="btn-card-action btn-card-specs"
+                              title="View technical specifications and reviews"
+                            >
+                              <span className="action-icon">✨</span>
+                              <span>Specs</span>
+                            </button>
+                          </div>
                         </>
                       ) : (
                         <button
                           onClick={() => trackProduct(product)}
                           disabled={isScraping}
-                          className="btn btn-primary btn-sm btn-full"
+                          className="btn-card-track"
                         >
-                          {isScraping ? "Tracking & Scraping..." : "Track Product"}
+                          {isScraping ? (
+                            <>
+                              <span className="btn-spinner"></span>
+                              <span>Tracking & Scraping...</span>
+                            </>
+                          ) : (
+                            <>
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                <line x1="12" y1="5" x2="12" y2="19"></line>
+                                <line x1="5" y1="12" x2="19" y2="12"></line>
+                              </svg>
+                              <span>Track Product</span>
+                            </>
+                          )}
                         </button>
                       )}
                     </div>
@@ -800,14 +1128,78 @@ function App() {
       {/* Tracked Products Section (3-4 Cards in a Row) */}
       <section className="dashboard-section">
         <div className="section-header-row">
-          <h2>Tracked Products ({trackedProducts.length})</h2>
+          <div className="section-title-wrap">
+            <h2>Tracked Products</h2>
+            <span className="section-count-badge">{trackedProducts.length}</span>
+          </div>
           <button
             onClick={loadTrackedProducts}
-            className="btn btn-sm btn-outline"
-            title="Refresh list"
+            className="btn-refresh-action"
+            title="Refresh tracked products and latest prices"
           >
-            Refresh List
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+            </svg>
+            <span>Refresh</span>
           </button>
+        </div>
+
+        {/* Filter and Sort Toolbar */}
+        <div className="tracked-controls-bar">
+          <div className="filter-pills-group">
+            <button
+              className={`filter-pill ${statusFilter === "all" ? "active" : ""}`}
+              onClick={() => setStatusFilter("all")}
+            >
+              <span>All</span>
+              <span className="pill-badge">{trackedProducts.length}</span>
+            </button>
+            <button
+              className={`filter-pill filter-pill-instock ${statusFilter === "in_stock" ? "active" : ""}`}
+              onClick={() => setStatusFilter("in_stock")}
+            >
+              <span className="pill-dot dot-green"></span>
+              <span>In Stock</span>
+              <span className="pill-badge">{inStockCount}</span>
+            </button>
+            <button
+              className={`filter-pill filter-pill-outstock ${statusFilter === "out_of_stock" ? "active" : ""}`}
+              onClick={() => setStatusFilter("out_of_stock")}
+            >
+              <span className="pill-dot dot-red"></span>
+              <span>Out of Stock</span>
+              <span className="pill-badge">{outOfStockCount}</span>
+            </button>
+            <button
+              className={`filter-pill filter-pill-pricedrop ${statusFilter === "price_drop" ? "active" : ""}`}
+              onClick={() => setStatusFilter("price_drop")}
+            >
+              <span className="pill-icon">📉</span>
+              <span>Price Drops</span>
+              <span className="pill-badge badge-accent">{activePriceDropsCount}</span>
+            </button>
+          </div>
+
+          <div className="sort-select-wrapper">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="20" x2="18" y2="4"></line>
+              <polyline points="21 7 18 4 15 7"></polyline>
+              <line x1="6" y1="4" x2="6" y2="20"></line>
+              <polyline points="3 17 6 20 9 17"></polyline>
+            </svg>
+            <span className="sort-label">Sort:</span>
+            <select
+              className="sort-select"
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value)}
+            >
+              <option value="recent">Recently Updated</option>
+              <option value="discount">Highest Discount</option>
+              <option value="price_asc">Price: Low to High</option>
+              <option value="price_desc">Price: High to Low</option>
+              <option value="name">Product Name (A-Z)</option>
+            </select>
+          </div>
         </div>
 
         {loadingProducts ? (
@@ -818,110 +1210,245 @@ function App() {
           </div>
         ) : (
           <div className="cards-grid">
-            {trackedProducts.map((product) => {
-              const history = productHistory[product.product_id] || [];
-              const logs = productLogs[product.product_id] || [];
-              const latest = history.length > 0 ? history[history.length - 1] : null;
-              const isScraping = !!scrapingStatus[product.product_id];
+            {trackedProducts
+              .filter((p) => {
+                const history = productHistory[p.product_id] || [];
+                const latest =
+                  history.length > 0 ? history[history.length - 1] : null;
+                if (statusFilter === "in_stock")
+                  return latest && latest.stock > 0;
+                if (statusFilter === "out_of_stock")
+                  return latest && latest.stock === 0;
+                if (statusFilter === "price_drop") {
+                  if (history.length < 2) return false;
+                  return (
+                    Number(latest?.price || 0) <
+                    Number(history[history.length - 2].price)
+                  );
+                }
+                return true;
+              })
+              .sort((a, b) => {
+                const histA = productHistory[a.product_id] || [];
+                const histB = productHistory[b.product_id] || [];
+                const latA = histA.length > 0 ? histA[histA.length - 1] : null;
+                const latB = histB.length > 0 ? histB[histB.length - 1] : null;
 
-              return (
-                <div className="product-card" key={product.product_id}>
-                  {/* Top: ID & Store Link */}
-                  <div className="card-top">
-                    <div className="card-tag-row">
-                      <span className="product-id-tag">ID: {product.product_id}</span>
-                      <a
-                        href={product.product_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="external-link"
-                        title="View on store"
-                      >
-                        Store ↗
-                      </a>
-                    </div>
-                    <h4 className="card-title" title={product.product_name}>
-                      {product.product_name}
-                    </h4>
-                    <div className="card-subtitle-row">
-                      {product.brand && <span>{product.brand}</span>}
-                      {product.brand && product.category && <span className="bullet">·</span>}
-                      {product.category && <span className="product-cat-text">{product.category}</span>}
-                    </div>
-                  </div>
+                if (sortBy === "name")
+                  return a.product_name.localeCompare(b.product_name);
+                if (sortBy === "price_asc")
+                  return (latA?.price || 0) - (latB?.price || 0);
+                if (sortBy === "price_desc")
+                  return (latB?.price || 0) - (latA?.price || 0);
+                if (sortBy === "discount") {
+                  const discA =
+                    histA.length >= 2
+                      ? Number(histA[histA.length - 2].price) -
+                        Number(latA?.price || 0)
+                      : 0;
+                  const discB =
+                    histB.length >= 2
+                      ? Number(histB[histB.length - 2].price) -
+                        Number(latB?.price || 0)
+                      : 0;
+                  return discB - discA;
+                }
+                const timeA = latA ? new Date(latA.scraped_at).getTime() : 0;
+                const timeB = latB ? new Date(latB.scraped_at).getTime() : 0;
+                return timeB - timeA;
+              })
+              .map((product) => {
+                const history = productHistory[product.product_id] || [];
+                const logs = productLogs[product.product_id] || [];
+                const latest =
+                  history.length > 0 ? history[history.length - 1] : null;
+                const isScraping = !!scrapingStatus[product.product_id];
 
-                  {/* Middle: Price & Stock metrics */}
-                  <div className="card-body-section">
-                    {latest ? (
-                      <div className="card-price-row">
-                        <div className="card-price-block">
-                          <span className="metric-label">Current Price</span>
-                          <span className="metric-value price-text">
-                            ₹{latest.price.toLocaleString("en-IN")}
+                const prices = history
+                  .map((h) => Number(h.price))
+                  .filter((v) => Number.isFinite(v) && v > 0);
+                const minPrice = prices.length > 0 ? Math.min(...prices) : null;
+                const maxPrice = prices.length > 0 ? Math.max(...prices) : null;
+
+                return (
+                  <div className="product-card" key={product.product_id}>
+                    {/* Top: ID & Store Link */}
+                    <div className="card-top">
+                      <div className="card-tag-row">
+                        <span className="product-id-tag">
+                          ID: {product.product_id}
+                        </span>
+                        <a
+                          href={product.product_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="external-link"
+                          title="View on store"
+                        >
+                          Store ↗
+                        </a>
+                      </div>
+                      <h4 className="card-title" title={product.product_name}>
+                        {product.product_name}
+                      </h4>
+                      <div className="card-subtitle-row">
+                        {product.brand && <span>{product.brand}</span>}
+                        {product.brand && product.category && (
+                          <span className="bullet">·</span>
+                        )}
+                        {product.category && (
+                          <span className="product-cat-text">
+                            {product.category}
                           </span>
-                        </div>
-                        <div className="card-stock-block">
-                          <span className="metric-label">Stock Status</span>
-                          {latest.stock > 0 ? (
-                            <span className="badge badge-success">
-                              In Stock ({latest.stock})
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Middle: Price & Stock metrics */}
+                    <div className="card-body-section">
+                      {latest ? (
+                        <div className="card-price-row">
+                          <div className="card-price-block">
+                            <span className="metric-label">Current Price</span>
+                            <span className="metric-value price-text">
+                              ₹{latest.price.toLocaleString("en-IN")}
                             </span>
-                          ) : (
-                            <span className="badge badge-danger">Out of Stock</span>
-                          )}
+                            {minPrice !== null &&
+                              maxPrice !== null &&
+                              prices.length > 1 && (
+                                <div className="card-price-range">
+                                  Range: ₹{minPrice.toLocaleString("en-IN")} – ₹
+                                  {maxPrice.toLocaleString("en-IN")}
+                                </div>
+                              )}
+                          </div>
+                          <div className="card-stock-block">
+                            <span className="metric-label">Stock Status</span>
+                            {latest.stock > 0 ? (
+                              <span className="badge badge-success">
+                                In Stock ({latest.stock})
+                              </span>
+                            ) : (
+                              <span className="badge badge-danger">
+                                Out of Stock
+                              </span>
+                            )}
+                          </div>
                         </div>
+                      ) : (
+                        <div className="card-price-row">
+                          <div className="card-price-block">
+                            <span className="metric-label">Current Price</span>
+                            <span className="metric-value price-text text-muted">
+                              —
+                            </span>
+                          </div>
+                          <div className="card-stock-block">
+                            <span className="metric-label">Status</span>
+                            <span className="badge badge-neutral">
+                              {isScraping
+                                ? "Scraping..."
+                                : "Pending initial scrape"}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                      <div className="card-last-updated">
+                        {latest
+                          ? `Last updated: ${new Date(latest.scraped_at).toLocaleTimeString("en-IN", {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}`
+                          : isScraping
+                            ? "Scraping price & stock..."
+                            : "Awaiting initial scrape"}
                       </div>
-                    ) : (
-                      <div className="card-price-row">
-                        <div className="card-price-block">
-                          <span className="metric-label">Current Price</span>
-                          <span className="metric-value price-text text-muted">—</span>
+
+                      {/* Per-Product Scrape Frequency Selector */}
+                      <div className="card-frequency-row">
+                        <div className="frequency-label-wrap">
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <polyline points="12 6 12 12 16 14"></polyline>
+                          </svg>
+                          <span>Check Interval</span>
                         </div>
-                        <div className="card-stock-block">
-                          <span className="metric-label">Status</span>
-                          <span className="badge badge-neutral">
-                            {isScraping ? "Scraping..." : "Pending initial scrape"}
-                          </span>
-                        </div>
+                        <select
+                          className="frequency-select"
+                          value={String(product.scrape_interval_minutes || 120)}
+                          onChange={(e) =>
+                            handleFrequencyChange(
+                              product.product_id,
+                              e.target.value,
+                            )
+                          }
+                        >
+                          <option value="15">Every 15m</option>
+                          <option value="30">Every 30m</option>
+                          <option value="60">Every 1h</option>
+                          <option value="120">Every 2h (default)</option>
+                          <option value="360">Every 6h</option>
+                          <option value="720">Every 12h</option>
+                          <option value="1440">Every 24h</option>
+                        </select>
                       </div>
-                    )}
-                    <div className="card-last-updated">
-                      {latest
-                        ? `Last updated: ${new Date(latest.scraped_at).toLocaleTimeString("en-IN", {
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          })}`
-                        : isScraping
-                        ? "Scraping price & stock..."
-                        : "Awaiting initial scrape"}
+                    </div>
+
+                    {/* Bottom: Actions */}
+                    <div className="card-actions-row">
+                      <button
+                        onClick={() => handleScrapeNow(product.product_id)}
+                        disabled={isScraping}
+                        className="btn-card-scrape"
+                        title="Scrape price & stock now"
+                      >
+                        {isScraping ? (
+                          <>
+                            <span className="btn-spinner"></span>
+                            <span>Scraping...</span>
+                          </>
+                        ) : (
+                          <>
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round">
+                              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                            </svg>
+                            <span>Scrape Now</span>
+                          </>
+                        )}
+                      </button>
+
+                      <div className="card-secondary-actions">
+                        <button
+                          onClick={() => openProductModal(product, "history")}
+                          className="btn-card-action"
+                          title="View price history chart"
+                        >
+                          <span className="action-icon">📈</span>
+                          <span>History</span>
+                          {history.length > 0 && <span className="btn-badge">{history.length}</span>}
+                        </button>
+                        <button
+                          onClick={() => openProductModal(product, "logs")}
+                          className="btn-card-action"
+                          title="View scraper run logs"
+                        >
+                          <span className="action-icon">📋</span>
+                          <span>Logs</span>
+                          {logs.length > 0 && <span className="btn-badge">{logs.length}</span>}
+                        </button>
+                        <button
+                          onClick={() => openProductModal(product, "specs")}
+                          className="btn-card-action btn-card-specs"
+                          title="View technical specifications and reviews"
+                        >
+                          <span className="action-icon">✨</span>
+                          <span>Specs</span>
+                        </button>
+                      </div>
                     </div>
                   </div>
-
-                  {/* Bottom: Actions */}
-                  <div className="card-actions-row">
-                    <button
-                      onClick={() => handleScrapeNow(product.product_id)}
-                      disabled={isScraping}
-                      className="btn btn-sm btn-primary"
-                    >
-                      {isScraping ? "Scraping..." : "Scrape Now"}
-                    </button>
-                    <button
-                      onClick={() => openProductModal(product, "history")}
-                      className="btn btn-sm btn-outline"
-                    >
-                      History & Graph ({history.length})
-                    </button>
-                    <button
-                      onClick={() => openProductModal(product, "logs")}
-                      className="btn btn-sm btn-outline"
-                    >
-                      Logs ({logs.length})
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })}
           </div>
         )}
       </section>
@@ -964,21 +1491,47 @@ function App() {
                   className={`modal-tab-btn ${modalTab === "history" ? "active" : ""}`}
                   onClick={() => setModalTab("history")}
                 >
-                  Price & Stock History ({(productHistory[modalProduct.product_id] || []).length})
+                  <span className="tab-icon">📈</span>
+                  <span>Price History</span>
+                  <span className="tab-badge">{(productHistory[modalProduct.product_id] || []).length}</span>
                 </button>
                 <button
                   className={`modal-tab-btn ${modalTab === "logs" ? "active" : ""}`}
                   onClick={() => setModalTab("logs")}
                 >
-                  Scrape Logs ({(productLogs[modalProduct.product_id] || []).length})
+                  <span className="tab-icon">📋</span>
+                  <span>Scrape Logs</span>
+                  <span className="tab-badge">{(productLogs[modalProduct.product_id] || []).length}</span>
+                </button>
+                <button
+                  className={`modal-tab-btn ${modalTab === "specs" ? "active" : ""}`}
+                  onClick={() => {
+                    setModalTab("specs");
+                    loadProductDetails(modalProduct.product_id);
+                  }}
+                >
+                  <span className="tab-icon">✨</span>
+                  <span>Specs & Reviews</span>
                 </button>
               </div>
               <button
                 onClick={() => handleScrapeNow(modalProduct.product_id)}
                 disabled={scrapingStatus[modalProduct.product_id]}
-                className="btn btn-sm btn-primary"
+                className="btn-modal-scrape"
               >
-                {scrapingStatus[modalProduct.product_id] ? "Scraping..." : "Scrape Now"}
+                {scrapingStatus[modalProduct.product_id] ? (
+                  <>
+                    <span className="btn-spinner"></span>
+                    <span>Scraping...</span>
+                  </>
+                ) : (
+                  <>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round">
+                      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                    </svg>
+                    <span>Scrape Now</span>
+                  </>
+                )}
               </button>
             </div>
 
@@ -1094,6 +1647,109 @@ function App() {
                         </tbody>
                       </table>
                     </div>
+                  )}
+                </div>
+              )}
+
+              {modalTab === "specs" && (
+                <div className="tab-pane">
+                  {loadingDetails ? (
+                    <div className="tab-loading-state">
+                      <span className="btn-spinner tab-spinner"></span>
+                      <span>Loading specifications & customer reviews from store...</span>
+                    </div>
+                  ) : !productDetails[modalProduct.product_id] ? (
+                    <div className="tab-error-state">
+                      <p>Could not load specs and reviews for this product from the store catalog.</p>
+                      <button
+                        className="btn btn-sm btn-outline"
+                        onClick={() => loadProductDetails(modalProduct.product_id, true)}
+                      >
+                        🔄 Retry Loading
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      {productDetails[modalProduct.product_id].description && (
+                        <div className="specs-section-block">
+                          <h4 className="pane-section-title">Product Description</h4>
+                          <p className="product-overview-desc">
+                            {productDetails[modalProduct.product_id].description}
+                          </p>
+                        </div>
+                      )}
+
+                      <div className="specs-section-block">
+                        <h4 className="pane-section-title">Technical Specifications</h4>
+                        {productDetails[modalProduct.product_id].specs &&
+                        Object.keys(productDetails[modalProduct.product_id].specs).length > 0 ? (
+                          <table className="specs-table">
+                            <tbody>
+                              {Object.entries(
+                                productDetails[modalProduct.product_id].specs,
+                              ).map(([key, val]) => (
+                                <tr key={key}>
+                                  <td className="specs-label">
+                                    {key
+                                      .replace(/([A-Z])/g, " $1")
+                                      .replace(/^./, (s) => s.toUpperCase())}
+                                  </td>
+                                  <td className="specs-val">{String(val)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        ) : (
+                          <p className="drawer-empty">No additional specifications listed for this product.</p>
+                        )}
+                      </div>
+
+                      <div className="specs-section-block">
+                        <h4 className="pane-section-title">
+                          Customer Reviews (
+                          {
+                            (
+                              productDetails[modalProduct.product_id].reviews || []
+                            ).length
+                          }
+                          )
+                        </h4>
+                        {(productDetails[modalProduct.product_id].reviews || []).length === 0 ? (
+                          <p className="drawer-empty">No reviews posted yet for this product.</p>
+                        ) : (
+                          <div className="reviews-grid">
+                            {(
+                              productDetails[modalProduct.product_id].reviews || []
+                            ).map((rev) => (
+                              <div className="review-card" key={rev.id}>
+                                <div className="review-header">
+                                  <div className="review-author-row">
+                                    <span className="review-author">{rev.author}</span>
+                                    <span className="review-stars">
+                                      {"★".repeat(rev.rating)}
+                                      {"☆".repeat(5 - rev.rating)}
+                                    </span>
+                                    {rev.verifiedPurchase && (
+                                      <span className="verified-tag">
+                                        Verified Purchase
+                                      </span>
+                                    )}
+                                  </div>
+                                  <span className="review-date">{rev.date}</span>
+                                </div>
+                                <div className="review-title">{rev.title}</div>
+                                <div className="review-body">{rev.body}</div>
+                                {rev.helpfulVotes > 0 && (
+                                  <div className="review-helpful">
+                                    👍 {rev.helpfulVotes} people found this helpful
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </>
                   )}
                 </div>
               )}

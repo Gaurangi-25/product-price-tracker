@@ -68,8 +68,29 @@ A robust, full-stack web application designed for the **INE Software Engineer In
    - **Interactive SVG Price Chart**: Dynamic visual trend line graph showing price trajectory over time with interactive point details.
    - **Chronological History Table**: Complete price and stock audit log per product.
    - **On-Demand Scraping**: One-click "⚡ Scrape Now" button on each card with polling feedback.
-5. **Observable Headed Mode**:
+5. **Price-Drop & Back-In-Stock Alerts (In-App & Email)**:
+   - Automatically compares each new scrape with historical baselines.
+   - Computes discount amounts and drop percentages (e.g. *Price dropped by ₹2,000 (15% OFF)*).
+   - In-app notification center with an animated radar-ping bell and slide-down drawer.
+   - Built-in SendGrid v3 mail dispatcher for automated email alerts.
+6. **Multi-Product Analytics & Extra Product Metadata**:
+   - **Cross-Catalog KPI Bar**: Displays total monitored items, current in-stock vs out-of-stock counts, active price drops, and last sync timestamp.
+   - **Interactive Filtering & Multi-Sort**: Filter by `All`, `In Stock`, `Out of Stock`, and `Price Drops`; sort by `Recently Updated`, `Highest Discount`, `Price Low/High`, and `Alphabetical`.
+   - **Specs & Reviews Panel**: Direct proxy to store catalog API delivering technical specifications (Warranty, Country of Origin, Material, Weight) and verified customer reviews with 5-star ratings and helpful vote metrics.
+7. **Store Redesign / DOM Drift Change Detection**:
+   - Audits core DOM structure anchors (`.price-block`, `button`, `h1`) after navigation.
+   - Flags structural changes into the system health telemetry endpoint (`/api/system/health`).
+8. **Configurable Scrape Frequency per Product**:
+   - Per-product dropdown (`15m`, `30m`, `1h`, `2h`, `6h`, `12h`, `24h`) with instant optimistic updates and browser `localStorage` persistence.
+   - Frequency-aware cron engine that skips products whose interval has not elapsed.
+9. **Observable Headed Mode**:
    - Can run headlessly for scheduled cron runs or headed (`npm run scrape:headed`) for visual demonstration and screen recording.
+10. **CI/CD Pipeline with GitHub Actions**:
+    - Automated workflow in `.github/workflows/ci.yml` validating backend syntax, compiling production frontend assets, and triggering deployments.
+11. **Self-Healing Product Name Resolution**:
+    - Multi-tier resolution ensures products always display authentic titles instead of generic placeholders (e.g., `Product 187`).
+    - Waits for `<h1>` visibility with automated fallback to the store product API and catalog cache.
+    - Automated runtime self-healing repairs legacy placeholders in the database seamlessly on read and write.
 
 ---
 
@@ -219,14 +240,20 @@ Because Playwright requires Linux OS libraries (`libgbm`, `libnss3`, `libasound2
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/` | Health check endpoint |
-| `GET` | `/api/products` | Lists all active tracked products |
+| `GET` | `/` | Basic server status check |
+| `GET` | `/api/products` | Lists all active tracked products with scrape intervals |
 | `POST` | `/api/products/track` | Upserts a product to `tracked_products` (`{ product_id, product_name, product_url }`) |
-| `POST` | `/api/scrape/:productId` | Spawns scraper for a single product |
-| `ALL` | `/api/cron/scrape` | Batch scrapes all active tracked products sequentially (for cron-job.org) |
+| `DELETE` | `/api/products/:productId` | Untracks a product (marks `is_active: false`) |
+| `POST` | `/api/scrape/:productId` | Spawns in-process scraper for a single product |
+| `ALL` | `/api/cron/scrape` | Frequency-aware batch scrape of active products (for cron-job.org) |
 | `GET` | `/api/products/:productId/history` | Chronological price & stock history for a product |
 | `GET` | `/api/products/:productId/logs` | Scrape attempt logs with duration, attempts, and error details |
-| `GET` | `/api/search?q=<query>` | Scrapes the store catalog for matching products |
+| `GET` | `/api/products/:productId/details` | Proxies store specs & verified reviews with rate-limit retry |
+| `PATCH` | `/api/products/:productId/frequency` | Updates individual product scrape frequency interval (`{ interval }`) |
+| `GET` | `/api/alerts` | Fetches recent price-drop and back-in-stock alerts |
+| `POST` | `/api/alerts/mark-read` | Marks all active alerts as read |
+| `GET` | `/api/system/health` | Telemetry endpoint reporting DOM drift status and system metrics |
+| `GET` | `/api/search?q=<query>` | Fast catalog search with cancellation support and Playwright fallback |
 
 ---
 
