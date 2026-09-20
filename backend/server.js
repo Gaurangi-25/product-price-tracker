@@ -111,7 +111,9 @@ app.all(["/api/cron/scrape", "/api/scrape-all"], async (req, res) => {
       return res.json({ message: "No active tracked products to scrape" });
     }
 
-    console.log(`⏱️ Cron triggered: starting batch scrape for ${products.length} products`);
+    console.log(
+      `⏱️ Cron triggered: starting batch scrape for ${products.length} products`,
+    );
 
     // Scrape sequentially in background so Render free-tier RAM isn't overloaded
     (async () => {
@@ -130,7 +132,6 @@ app.all(["/api/cron/scrape", "/api/scrape-all"], async (req, res) => {
     res.json({
       message: "Scraping cycle started for active products",
       count: products.length,
-      products: products.map((p) => ({ id: p.product_id, name: p.product_name })),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -251,7 +252,10 @@ app.delete("/api/products/:productId", async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
-    res.json({ message: "Product untracked successfully", product_id: productId });
+    res.json({
+      message: "Product untracked successfully",
+      product_id: productId,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -270,7 +274,7 @@ async function loadStoreCatalog(signal) {
     if (signal && signal.aborted) break;
     const res = await fetch(
       `https://demo.inelabteamdev.com/api/catalog?page=${p}&pageSize=60`,
-      { signal }
+      { signal },
     );
     if (!res.ok) break;
     const data = await res.json();
@@ -391,7 +395,9 @@ app.get("/api/search", async (req, res) => {
 
       if (isAborted || req.destroyed) return;
 
-      console.log(`🔍 Search "${search}": found ${results.length} matches (with product details & recorded prices)`);
+      console.log(
+        `🔍 Search "${search}": found ${results.length} matches (with product details & recorded prices)`,
+      );
       return res.json(results);
     }
 
@@ -410,7 +416,7 @@ app.get("/api/search", async (req, res) => {
     await page.addInitScript(() => {
       const observer = new MutationObserver(() => {
         const btn = Array.from(document.querySelectorAll("button")).find((b) =>
-          /accept/i.test(b.textContent || "")
+          /accept/i.test(b.textContent || ""),
         );
         if (btn && btn.offsetParent !== null) {
           btn.click();
@@ -458,7 +464,11 @@ app.get("/api/search", async (req, res) => {
 
         let productUrl = page.url();
         if (productUrl.includes("/product/")) {
-          const productId = productUrl.split("/product/").pop().split("/").shift();
+          const productId = productUrl
+            .split("/product/")
+            .pop()
+            .split("/")
+            .shift();
           if (productId) {
             results.push({
               product_id: productId,
@@ -473,8 +483,14 @@ app.get("/api/search", async (req, res) => {
       if (results.length > 0 || isAborted || req.destroyed) break;
 
       // Next page
-      const nextBtn = page.locator("button").filter({ hasText: /NEXT/i }).last();
-      if ((await nextBtn.count()) && (await nextBtn.isVisible().catch(() => false))) {
+      const nextBtn = page
+        .locator("button")
+        .filter({ hasText: /NEXT/i })
+        .last();
+      if (
+        (await nextBtn.count()) &&
+        (await nextBtn.isVisible().catch(() => false))
+      ) {
         await nextBtn.click({ force: true });
         await page.waitForTimeout(600);
       } else {
