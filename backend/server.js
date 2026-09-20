@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const supabase = require("./supabase");
 const { chromium } = require("playwright");
+const { getAlerts, markAlertsRead, getSystemHealth } = require("./alerts");
 
 const app = express();
 
@@ -9,6 +10,9 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
+
+// In-memory scrape frequency map (safe fallback even without schema migration)
+const productFrequencyMap = {};
 
 // ----------------------------------------
 // TEST API
@@ -36,7 +40,13 @@ app.get("/api/products", async (req, res) => {
       });
     }
 
-    res.json(data);
+    const enhanced = (data || []).map((p) => ({
+      ...p,
+      scrape_interval_minutes:
+        productFrequencyMap[String(p.product_id)] || p.scrape_interval_minutes || 120,
+    }));
+
+    res.json(enhanced);
   } catch (error) {
     res.status(500).json({
       error: error.message,
@@ -88,7 +98,7 @@ app.post("/api/scrape/:productId", async (req, res) => {
 });
 
 // ----------------------------------------
-// CRON / BULK SCRAPE ALL ACTIVE PRODUCTS
+// CRON / BULK SCRAPE ALL ACTIVE PRODUCTS (Frequency Aware)
 // ----------------------------------------
 app.all(["/api/cron/scrape", "/api/scrape-all"], async (req, res) => {
   try {
@@ -111,14 +121,54 @@ app.all(["/api/cron/scrape", "/api/scrape-all"], async (req, res) => {
       return res.json({ message: "No active tracked products to scrape" });
     }
 
+    // Filter products that are due based on their configured frequency
+    const now = Date.now();
+    const dueProducts = [];
+
+    for (const p of products) {
+      const intervalMins =
+        productFrequencyMap[p.product_id] || p.scrape_interval_minutes || 120;
+      const intervalMs = intervalMins * 60 * 1000;
+
+      // Check last scrape time
+      const { data: latestHistory } = await supabase
+        .from("price_history")
+        .select("scraped_at")
+        .eq("product_id", p.product_id)
+        .order("scraped_at", { ascending: false })
+        .limit(1);
+
+      if (!latestHistory || latestHistory.length === 0) {
+        dueProducts.push(p);
+      } else {
+        const lastScrapedMs = new Date(latestHistory[0].scraped_at).getTime();
+        if (now - lastScrapedMs >= intervalMs) {
+          dueProducts.push(p);
+        } else {
+          const minsAgo = Math.round((now - lastScrapedMs) / 60000);
+          console.log(
+            `⏱️ Skipping product ${p.product_id} (${p.product_name}): scraped ${minsAgo}m ago (interval: ${intervalMins}m)`,
+          );
+        }
+      }
+    }
+
     console.log(
-      `⏱️ Cron triggered: starting batch scrape for ${products.length} products`,
+      `⏱️ Cron triggered: ${dueProducts.length}/${products.length} products due for scrape`,
     );
+
+    if (dueProducts.length === 0) {
+      return res.json({
+        message: "All tracked products are up-to-date with their scrape intervals",
+        total_tracked: products.length,
+        scraped_count: 0,
+      });
+    }
 
     // Scrape sequentially in background so Render free-tier RAM isn't overloaded
     (async () => {
       const { scrapeProduct } = require("./scraper");
-      for (const p of products) {
+      for (const p of dueProducts) {
         try {
           console.log(`⏱️ Batch scraping product ${p.product_id}...`);
           await scrapeProduct(p.product_url);
@@ -126,12 +176,14 @@ app.all(["/api/cron/scrape", "/api/scrape-all"], async (req, res) => {
           console.error(`⏱️ Error scraping ${p.product_id}:`, err.message);
         }
       }
-      console.log(`✅ Batch scrape complete`);
+      console.log(`✅ Batch scrape complete (${dueProducts.length} items)`);
     })();
 
     res.json({
-      message: "Scraping cycle started for active products",
-      count: products.length,
+      message: "Scraping cycle started for due products",
+      due_count: dueProducts.length,
+      total_tracked: products.length,
+      products: dueProducts.map((p) => ({ id: p.product_id, name: p.product_name })),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -256,6 +308,151 @@ app.delete("/api/products/:productId", async (req, res) => {
       message: "Product untracked successfully",
       product_id: productId,
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ----------------------------------------
+// UPDATE SCRAPE FREQUENCY PER PRODUCT
+// ----------------------------------------
+app.patch("/api/products/:productId/frequency", async (req, res) => {
+  try {
+    const { productId } = req.params;
+    const { interval } = req.body; // in minutes (e.g. 30, 60, 120, 360, 1440)
+    const mins = parseInt(interval, 10) || 120;
+    productFrequencyMap[String(productId)] = mins;
+
+    // Persist to Supabase if column exists (safely catch and ignore error if not migrated)
+    await supabase
+      .from("tracked_products")
+      .update({ scrape_interval_minutes: mins })
+      .eq("product_id", String(productId))
+      .catch(() => {});
+
+    console.log(`⏱️ Updated scrape frequency for product ${productId} to ${mins} minutes`);
+    res.json({
+      message: "Scrape frequency updated",
+      product_id: productId,
+      scrape_interval_minutes: mins,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ----------------------------------------
+// GET IN-APP ALERTS (Price drops & Restocks)
+// ----------------------------------------
+app.get("/api/alerts", async (req, res) => {
+  try {
+    const alerts = await getAlerts();
+    res.json(alerts);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ----------------------------------------
+// MARK ALERTS AS READ
+// ----------------------------------------
+app.post("/api/alerts/mark-read", (req, res) => {
+  try {
+    const result = markAlertsRead();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ----------------------------------------
+// SYSTEM HEALTH & DOM DRIFT MONITORING
+// ----------------------------------------
+app.get("/api/system/health", (req, res) => {
+  try {
+    const health = getSystemHealth();
+    res.json(health);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ----------------------------------------
+// GET PRODUCT SPECS & REVIEWS (Store Details API)
+// ----------------------------------------
+const productDetailsCache = {};
+const DETAILS_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
+app.get("/api/products/:productId/details", async (req, res) => {
+  try {
+    const { productId } = req.params;
+    const now = Date.now();
+
+    if (
+      productDetailsCache[productId] &&
+      now - productDetailsCache[productId].time < DETAILS_CACHE_TTL
+    ) {
+      return res.json(productDetailsCache[productId].data);
+    }
+
+    // Attempt fetch with retry on rate limit (mock store limits to ~1 req/sec)
+    let data = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await fetch(
+        `https://demo.inelabteamdev.com/api/product/${productId}`,
+      );
+
+      if (response.status === 429 || response.status === 503) {
+        let retryDelay = 1200;
+        try {
+          const errBody = await response.json();
+          if (errBody.retryAfter) {
+            retryDelay = Math.max(1000, errBody.retryAfter * 1000 + 200);
+          }
+        } catch (_) {}
+        await new Promise((r) => setTimeout(r, retryDelay));
+        continue;
+      }
+
+      if (!response.ok) {
+        break;
+      }
+
+      data = await response.json();
+      if (data && data.error === "rate_limited") {
+        const retryDelay = (data.retryAfter || 1) * 1000 + 200;
+        await new Promise((r) => setTimeout(r, retryDelay));
+        continue;
+      }
+
+      break;
+    }
+
+    if (!data || data.error) {
+      // Fallback: Check if we have this product in pre-warmed catalogCache
+      const catalogItem = (catalogCache || []).find(
+        (i) => String(i.id) === String(productId),
+      );
+      if (catalogItem) {
+        data = {
+          id: catalogItem.id,
+          name: catalogItem.name,
+          brand: catalogItem.brand,
+          category: catalogItem.category,
+          sku: catalogItem.sku,
+          description: catalogItem.description,
+          specs: {},
+          reviews: [],
+        };
+      } else {
+        return res
+          .status(404)
+          .json({ error: "Product details currently unavailable from store" });
+      }
+    }
+
+    productDetailsCache[productId] = { time: now, data };
+    res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -404,9 +601,37 @@ app.get("/api/search", async (req, res) => {
     // 2. Fallback to Playwright if catalog API is unavailable
     if (isAborted || req.destroyed) return;
 
-    browser = await chromium.launch({
-      headless: true,
-    });
+    try {
+      browser = await chromium.launch({
+        headless: true,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+        ],
+      });
+    } catch (launchErr) {
+      if (
+        launchErr.message.includes("Executable doesn't exist") ||
+        launchErr.message.includes("npx playwright install")
+      ) {
+        console.warn("⚠️ Chromium executable missing. Auto-installing Playwright Chromium...");
+        const { execSync } = require("child_process");
+        execSync("npx playwright install chromium", { stdio: "inherit" });
+        browser = await chromium.launch({
+          headless: true,
+          args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+          ],
+        });
+      } else {
+        throw launchErr;
+      }
+    }
 
     if (isAborted || req.destroyed) return;
 

@@ -1,5 +1,6 @@
 const { chromium } = require("playwright");
 const supabase = require("./supabase");
+const { evaluateAndRecordAlerts, recordDomHealth } = require("./alerts");
 
 // Target URL from CLI argument or environment variable
 const DEFAULT_URL = "https://demo.inelabteamdev.com/product/632";
@@ -262,6 +263,35 @@ async function scrapeProduct(productUrl = targetUrl) {
           timeout: 30000,
         });
 
+        // 1. Audit DOM structure health & detect website redesign / drift
+        const domAudit = await page.evaluate(() => {
+          const hasPriceBlock = !!document.querySelector(".price-block");
+          const hasButton = !!document.querySelector(".price-block button");
+          const hasTitle = !!document.querySelector("h1");
+          const missing = [];
+          if (!hasPriceBlock) missing.push(".price-block");
+          if (!hasButton) missing.push(".price-block button");
+          if (!hasTitle) missing.push("h1");
+          return {
+            status: missing.length === 0 ? "stable" : "drift_detected",
+            missing,
+          };
+        });
+
+        recordDomHealth({
+          status: domAudit.status,
+          selectorsFound: 3 - domAudit.missing.length,
+          totalSelectors: 3,
+          details:
+            domAudit.status === "stable"
+              ? "All store structure anchors (.price-block, button, h1) intact"
+              : `Store structure drift detected: Missing ${domAudit.missing.join(", ")}`,
+        });
+
+        if (domAudit.status !== "stable") {
+          console.warn(`⚠️ DOM Drift Warning: missing ${domAudit.missing.join(", ")}`);
+        }
+
         // Read and persist product name
         const productName =
           (
@@ -413,6 +443,14 @@ async function scrapeProduct(productUrl = targetUrl) {
               attempts: totalAttempts,
               price,
               stock,
+            });
+
+            // Trigger Price-Drop & Back-in-Stock Alerts engine
+            await evaluateAndRecordAlerts({
+              productId,
+              productName,
+              newPrice: price,
+              newStock: stock,
             });
 
             cycleDone = true;
